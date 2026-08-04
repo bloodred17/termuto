@@ -24,12 +24,20 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Run from the project directory with its sample catalog:
+Run from the project directory with its sample catalog. The default catalog lives
+at `~/.termuto/catalog.json`, so point at the repository copy explicitly:
 
 ```bash
-cargo run -- latest
-cargo run -- search "solo"
-cargo run -- ongoing
+cargo run -- --catalog ./catalog.json latest
+cargo run -- --catalog ./catalog.json search "solo"
+cargo run -- --catalog ./catalog.json ongoing
+cargo run -- --catalog ./catalog.json tui
+```
+
+Or export it once for the shell session:
+
+```bash
+export TERMUTO_CATALOG="$PWD/catalog.json"
 cargo run -- tui
 ```
 
@@ -41,13 +49,18 @@ The Cargo package is named `termuto-poc`; it installs a binary named `termuto`.
 cargo install --path . --locked
 ```
 
-From any directory, supply an absolute catalog path for the first run:
+Install a catalog at the default location so the binary works from any directory:
+
+```bash
+mkdir -p ~/.termuto
+cp catalog.json ~/.termuto/catalog.json
+```
+
+After that, `termuto latest`, `termuto search "solo"`, `termuto ongoing`, and
+`termuto tui` work anywhere. To use a catalog elsewhere, pass it explicitly:
 
 ```bash
 termuto --catalog /absolute/path/to/catalog.json latest
-termuto --catalog /absolute/path/to/catalog.json search "solo"
-termuto --catalog /absolute/path/to/catalog.json ongoing
-termuto --catalog /absolute/path/to/catalog.json tui
 ```
 
 Uninstall with:
@@ -62,7 +75,9 @@ The catalog path is resolved in this order:
 
 1. Global `--catalog <PATH>` option.
 2. `TERMUTO_CATALOG` environment variable.
-3. `./catalog.json`.
+3. `~/.termuto/catalog.json`.
+
+If the home directory cannot be determined, the last step falls back to `./catalog.json`.
 
 The global option is accepted before or after a subcommand, for example:
 
@@ -75,8 +90,8 @@ TERMUTO_CATALOG=/data/anime.json termuto ongoing
 If no file exists at the resolved path, the program does not create one. It returns an error including the attempted path and the remediation:
 
 ```text
-Catalog not found at /path/catalog.json.
-Pass --catalog <PATH> or set TERMUTO_CATALOG.
+Catalog not found at /home/you/.termuto/catalog.json.
+Pass --catalog <PATH>, set TERMUTO_CATALOG, or place a catalog at ~/.termuto/catalog.json.
 ```
 
 ## CLI

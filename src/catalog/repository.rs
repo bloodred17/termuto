@@ -17,7 +17,7 @@ impl CatalogRepository {
         let path = path.as_ref().to_path_buf();
         if !path.is_file() {
             bail!(
-                "Catalog not found at {}.\nPass --catalog <PATH> or set TERMUTO_CATALOG.",
+                "Catalog not found at {}.\nPass --catalog <PATH>, set TERMUTO_CATALOG, or place a catalog at ~/.termuto/catalog.json.",
                 path.display()
             );
         }

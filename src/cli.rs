@@ -12,7 +12,7 @@ use std::path::PathBuf;
     version
 )]
 pub struct Cli {
-    /// Path to the Deeb JSON catalog (defaults to TERMUTO_CATALOG or ./catalog.json)
+    /// Path to the Deeb JSON catalog (defaults to TERMUTO_CATALOG or ~/.termuto/catalog.json)
     #[arg(long, global = true, value_name = "PATH")]
     pub catalog: Option<PathBuf>,
 
@@ -68,6 +68,14 @@ pub async fn run(cli: Cli) -> Result<()> {
 pub fn resolve_catalog_path(option: Option<PathBuf>) -> PathBuf {
     option
         .or_else(|| env::var_os("TERMUTO_CATALOG").map(PathBuf::from))
+        .unwrap_or_else(default_catalog_path)
+}
+
+/// `~/.termuto/catalog.json`, so the binary works from any directory. Falls back
+/// to the working directory only when the home directory cannot be determined.
+fn default_catalog_path() -> PathBuf {
+    env::home_dir()
+        .map(|home| home.join(".termuto").join("catalog.json"))
         .unwrap_or_else(|| PathBuf::from("catalog.json"))
 }
 
