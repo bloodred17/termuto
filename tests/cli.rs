@@ -140,15 +140,16 @@ fn a_catalog_movie_plays_without_an_episode_number() {
         .stdout(predicate::str::contains("media/look-back.mkv"));
 }
 
-/// `frieren` carries no `source`, so the catalog provider declines and the next
-/// provider in the chain answers instead.
+/// `frieren` carries no `source`, so the catalog provider declines. ZokoAnime is
+/// addressed by MyAnimeList id, which a catalog row does not carry, so it
+/// declines too — and the failure names both rather than playing something else.
 #[test]
-fn a_catalog_row_without_a_source_falls_through_to_the_next_provider() {
+fn a_catalog_row_without_a_source_is_served_by_nothing_in_the_chain() {
     playable()
         .args(["play", "frieren"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("via mock"));
+        .failure()
+        .stderr(predicate::str::contains("catalog, zokoanime"));
 }
 
 #[test]

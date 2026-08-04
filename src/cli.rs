@@ -100,7 +100,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(issue) = source.catalog_issue() {
         eprintln!("warning: continuing without the local catalog — {issue}");
     }
-    let playback = Playback::for_source(&source, prefs, resolve_player(cli.player));
+    let playback = Playback::for_source(&source, prefs, resolve_player(cli.player))?;
 
     match cli.command {
         None | Some(Command::Tui) => tui::run(source, playback).await,

@@ -8,6 +8,7 @@
 //! dead extractor is a one-file change and never touches the frontends.
 
 use super::prefs::{Audio, Quality, TrackPrefs};
+use super::zoko::ZokoProvider;
 use crate::catalog::{AnimeKind, CatalogRepository};
 use crate::source::Origin;
 use anyhow::{Result, bail};
@@ -83,13 +84,14 @@ impl ProviderChain {
         Self { providers }
     }
 
-    /// The catalog answers for its own rows; the remote provider answers for
-    /// everything else. Adding a real extractor means inserting it here.
-    pub fn with_catalog(catalog: Option<CatalogRepository>) -> Self {
-        Self::new(vec![
+    /// The catalog answers for its own rows; ZokoAnime answers for the API rows,
+    /// which carry the MyAnimeList id it is addressed by. Adding another
+    /// extractor means inserting it here.
+    pub fn with_catalog(catalog: Option<CatalogRepository>) -> Result<Self> {
+        Ok(Self::new(vec![
             Box::new(CatalogProvider { catalog }),
-            Box::new(MockProvider),
-        ])
+            Box::new(ZokoProvider::new()?),
+        ]))
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -184,57 +186,10 @@ impl StreamProvider for CatalogProvider {
     }
 }
 
-/// Stands in for the per-host extractors, which are out of scope here. It
-/// answers every request that reaches it with one fixed manifest, so the
-/// resolve-and-play path is exercised end to end without a scraper.
-#[derive(Debug)]
-struct MockProvider;
-
-/// The placeholder manifest served for any remote request.
-const PLACEHOLDER_STREAM: &str =
-    "https://hls2.aniwatchtv.uk/v/scxqicy/8sk32ez9st/20e7jag7ev/oedld66ntijsmh/1080/index.m3u8";
-
-/// The site the placeholder manifest is served on behalf of.
-const PLACEHOLDER_ORIGIN: &str = "https://zokoanime.video";
-
-/// A browser user agent. The CDN serving these manifests rejects requests that
-/// do not look like they came from the player page.
-const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
-
-/// The headers a manifest request has to carry to be served. Without them the
-/// CDN answers 403 and the player exits without drawing a frame, so any provider
-/// resolving an embedded stream must attach these alongside the URL.
-fn embed_headers(origin: &str) -> Vec<(String, String)> {
-    vec![
-        ("Referer".to_string(), format!("{origin}/")),
-        ("Origin".to_string(), origin.to_string()),
-        ("User-Agent".to_string(), BROWSER_USER_AGENT.to_string()),
-    ]
-}
-
-#[async_trait]
-impl StreamProvider for MockProvider {
-    fn name(&self) -> &str {
-        "mock"
-    }
-
-    async fn resolve(&self, request: &StreamRequest) -> Result<Option<Stream>> {
-        Ok(Some(Stream {
-            url: PLACEHOLDER_STREAM.to_string(),
-            provider: self.name().to_string(),
-            headers: embed_headers(PLACEHOLDER_ORIGIN),
-            subtitles: Vec::new(),
-            audio: request.prefs.audio,
-            quality: Some("1080".to_string()),
-        }))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{PLACEHOLDER_STREAM, ProviderChain, Stream, StreamProvider, StreamRequest};
-    use crate::playback::prefs::{Audio, TrackPrefs};
+    use super::{ProviderChain, Stream, StreamProvider, StreamRequest};
+    use crate::playback::prefs::TrackPrefs;
     use crate::source::Origin;
     use anyhow::{Result, bail};
     use async_trait::async_trait;
@@ -274,40 +229,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_remote_row_resolves_through_the_mock_provider() {
-        let chain = ProviderChain::with_catalog(None);
-        let stream = chain
-            .resolve(&request(Origin::Live(1)))
-            .await
-            .expect("the mock answers");
-        assert_eq!(stream.url, PLACEHOLDER_STREAM);
-        assert_eq!(stream.provider, "mock");
-        assert_eq!(stream.audio, Audio::Sub);
-    }
-
-    /// The CDN answers 403 without these, and because the player is detached
-    /// that failure is invisible — so the headers are asserted, not assumed.
-    #[tokio::test]
-    async fn an_embedded_stream_carries_the_headers_its_host_demands() {
-        let chain = ProviderChain::with_catalog(None);
-        let stream = chain
-            .resolve(&request(Origin::Live(1)))
-            .await
-            .expect("the mock answers");
-        let named = |name: &str| {
-            stream
-                .headers
-                .iter()
-                .find(|(header, _)| header == name)
-                .map(|(_, value)| value.clone())
-        };
-        assert_eq!(
-            named("Referer").as_deref(),
-            Some("https://zokoanime.video/")
-        );
-        assert_eq!(named("Origin").as_deref(), Some("https://zokoanime.video"));
-        assert!(named("User-Agent").is_some_and(|agent| agent.starts_with("Mozilla/")));
+    /// The default chain is asserted here rather than exercised: resolving an
+    /// API row means a request to the live host, which a unit test must not make.
+    #[test]
+    fn the_catalog_is_tried_before_the_remote_extractor() {
+        let chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        assert_eq!(chain.names(), vec!["catalog", "zokoanime"]);
     }
 
     #[tokio::test]
@@ -344,14 +271,17 @@ mod tests {
         }
     }
 
+    /// ZokoAnime is addressed by MyAnimeList id, which a catalog row has none of,
+    /// so nothing behind the catalog can stand in for it.
     #[tokio::test]
-    async fn a_cached_row_with_no_catalog_falls_through_to_the_next_provider() {
-        let chain = ProviderChain::with_catalog(None);
-        let stream = chain
+    async fn a_cached_row_no_provider_recognises_names_what_was_tried() {
+        let chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        let error = chain
             .resolve(&request(Origin::Cached("solo-leveling".into())))
             .await
-            .expect("falls through to the mock");
-        assert_eq!(stream.provider, "mock");
+            .expect_err("nothing serves a catalog row without a catalog");
+        let message = format!("{error:#}");
+        assert!(message.contains("catalog, zokoanime"), "{message}");
     }
 
     #[tokio::test]

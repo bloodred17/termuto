@@ -8,6 +8,7 @@
 pub mod player;
 pub mod prefs;
 pub mod provider;
+pub mod zoko;
 
 use crate::catalog::CatalogRepository;
 use crate::source::Source;
@@ -25,16 +26,20 @@ pub struct Playback {
 }
 
 impl Playback {
-    pub fn new(catalog: Option<CatalogRepository>, prefs: TrackPrefs, player: String) -> Self {
-        Self {
-            chain: ProviderChain::with_catalog(catalog),
+    pub fn new(
+        catalog: Option<CatalogRepository>,
+        prefs: TrackPrefs,
+        player: String,
+    ) -> Result<Self> {
+        Ok(Self {
+            chain: ProviderChain::with_catalog(catalog)?,
             player: Player::new(player),
             prefs,
-        }
+        })
     }
 
     /// Builds the same playback surface both frontends use from an open source.
-    pub fn for_source(source: &Source, prefs: TrackPrefs, player: String) -> Self {
+    pub fn for_source(source: &Source, prefs: TrackPrefs, player: String) -> Result<Self> {
         Self::new(source.catalog().cloned(), prefs, player)
     }
 
