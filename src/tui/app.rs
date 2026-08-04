@@ -11,6 +11,7 @@ pub(crate) enum Screen {
     Episodes,
     MovieDetail,
     PlaybackNotice,
+    QuitConfirm,
 }
 
 pub(crate) struct App {
@@ -18,6 +19,7 @@ pub(crate) struct App {
     pub(crate) screen: Screen,
     pub(crate) previous_screen: Screen,
     pub(crate) detail_origin: Screen,
+    pub(crate) quit_origin: Screen,
     pub(crate) home_index: usize,
     pub(crate) list_index: usize,
     pub(crate) episode_index: usize,
@@ -35,6 +37,7 @@ impl App {
             screen: Screen::Home,
             previous_screen: Screen::Home,
             detail_origin: Screen::Home,
+            quit_origin: Screen::Home,
             home_index: 0,
             list_index: 0,
             episode_index: 0,
@@ -46,8 +49,17 @@ impl App {
         }
     }
 
-    pub(crate) fn current_items(&self) -> &[Anime] {
+    /// The screen whose contents are on show. The quit prompt is an overlay, so
+    /// the screen it was raised from keeps rendering underneath it.
+    pub(crate) fn display_screen(&self) -> Screen {
         match self.screen {
+            Screen::QuitConfirm => self.quit_origin,
+            screen => screen,
+        }
+    }
+
+    pub(crate) fn current_items(&self) -> &[Anime] {
+        match self.display_screen() {
             Screen::Latest => &self.latest,
             Screen::Ongoing => &self.ongoing,
             Screen::Search => &self.search_results,
@@ -63,6 +75,11 @@ impl App {
             return Ok(true);
         }
 
+        // The quit prompt swallows every other binding until it is answered.
+        if self.screen == Screen::QuitConfirm {
+            return Ok(self.handle_quit_confirm_key(key));
+        }
+
         if self.screen == Screen::Search {
             return self.handle_search_key(key).await;
         }
@@ -70,7 +87,10 @@ impl App {
         match key.code {
             // `q` is reserved for the query text while Search has focus, but quits
             // from every other screen so users are never forced through a menu path.
-            KeyCode::Char('q') => Ok(false),
+            KeyCode::Char('q') => {
+                self.request_quit();
+                Ok(true)
+            }
             KeyCode::Esc => {
                 self.go_back();
                 Ok(true)
@@ -98,6 +118,24 @@ impl App {
             KeyCode::Enter => self.select_current().await,
             _ => Ok(true),
         }
+    }
+
+    /// Returns `false` once the user confirms the quit; every other key either
+    /// dismisses the prompt or is ignored.
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => false,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.screen = self.quit_origin;
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn request_quit(&mut self) {
+        self.quit_origin = self.screen;
+        self.screen = Screen::QuitConfirm;
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -184,7 +222,7 @@ impl App {
                 0 => self.open_latest().await?,
                 1 => self.open_ongoing().await?,
                 2 => self.enter_search(),
-                3 => return Ok(false),
+                3 => self.request_quit(),
                 _ => unreachable!("home selection is bounded"),
             },
             Screen::Latest | Screen::Ongoing | Screen::Search => {
@@ -207,6 +245,8 @@ impl App {
                 self.screen = Screen::PlaybackNotice;
             }
             Screen::PlaybackNotice => self.screen = self.previous_screen,
+            // Answered by `handle_quit_confirm_key`, which runs before this.
+            Screen::QuitConfirm => {}
         }
         Ok(true)
     }
@@ -218,6 +258,7 @@ impl App {
             Screen::Search => self.screen = self.previous_screen,
             Screen::Episodes | Screen::MovieDetail => self.screen = self.detail_origin,
             Screen::PlaybackNotice => self.screen = self.previous_screen,
+            Screen::QuitConfirm => self.screen = self.quit_origin,
         }
     }
 }

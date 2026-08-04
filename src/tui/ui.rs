@@ -26,7 +26,7 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
         chunks[0],
     );
 
-    match app.screen {
+    match app.display_screen() {
         Screen::Home => render_home(frame, app, chunks[1]),
         Screen::Latest => render_anime_list(frame, app, chunks[1], "Latest releases"),
         Screen::Ongoing => render_anime_list(frame, app, chunks[1], "Ongoing"),
@@ -34,6 +34,11 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
         Screen::Episodes => render_episodes(frame, app, chunks[1]),
         Screen::MovieDetail => render_movie(frame, app, chunks[1]),
         Screen::PlaybackNotice => render_playback_notice(frame, chunks[1]),
+        Screen::QuitConfirm => unreachable!("the quit prompt is drawn as an overlay"),
+    }
+
+    if app.screen == Screen::QuitConfirm {
+        render_quit_confirm(frame, chunks[1]);
     }
 
     frame.render_widget(
@@ -147,6 +152,31 @@ fn render_playback_notice(frame: &mut Frame, area: Rect) {
     );
 }
 
+fn render_quit_confirm(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(50, 25, area);
+    frame.render_widget(Clear, popup);
+    let text = vec![
+        Line::from(Span::styled(
+            "Are you sure you want to quit?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("y — yes, quit    n — no, stay"),
+    ];
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Quit ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
 fn render_list(
     frame: &mut Frame,
     area: Rect,
@@ -190,6 +220,7 @@ fn help_text(screen: Screen) -> &'static str {
             "↑/↓ or j/k select • Enter play action • Esc back"
         }
         Screen::PlaybackNotice => "Enter or Esc back",
+        Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         _ => "↑/↓ or j/k select • Enter open • / Search • Esc back • q Quit",
     }
 }
