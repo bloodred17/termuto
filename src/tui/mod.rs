@@ -1,10 +1,10 @@
-//! Minimal interactive terminal interface built on the shared catalog repository.
+//! Minimal interactive terminal interface built on the shared data source.
 
 mod app;
 mod event;
 mod ui;
 
-use crate::catalog::CatalogRepository;
+use crate::source::Source;
 use anyhow::{Context, Result};
 use crossterm::{
     execute,
@@ -13,9 +13,9 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Stdout};
 
-pub async fn run(repository: CatalogRepository) -> Result<()> {
+pub async fn run(source: Source) -> Result<()> {
     let mut terminal = TerminalGuard::new()?;
-    let mut app = app::App::new(repository);
+    let mut app = app::App::new(source);
     let event_result = event::run(&mut terminal.terminal, &mut app).await;
     let restore_result = terminal.restore();
 

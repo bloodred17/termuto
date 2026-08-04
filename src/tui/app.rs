@@ -1,132 +1,348 @@
-use crate::catalog::{Anime, AnimeKind, CatalogRepository};
+use crate::catalog::AnimeKind;
+use crate::mode::Mode;
+use crate::source::{AnimeDetail, AnimeSummary, Origin, SeasonRef, Source};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// How many rows a listing screen requests. Deliberately modest: every live
+/// screen is one or two API pages.
+const LISTING_LIMIT: usize = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Screen {
     Home,
-    Latest,
-    Ongoing,
+    /// Any list of titles. The heading and rows live on the app.
+    Listing,
+    /// The year/season index from `/seasons`.
+    SeasonPicker,
     Search,
+    /// A title loaded from the API.
+    LiveDetail,
+    /// A catalog series and its episodes.
     Episodes,
+    /// A catalog movie.
     MovieDetail,
     PlaybackNotice,
     QuitConfirm,
+    /// Raised over whatever was on screen when a request failed.
+    Error,
+}
+
+/// Whether typing edits the query or moves through the results below it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchFocus {
+    Query,
+    Results,
+}
+
+/// Work that needs the network. Key handling records one, the event loop draws
+/// a loading frame, and only then runs it — so the UI never freezes silently.
+#[derive(Clone, Debug)]
+pub(crate) enum Action {
+    Top,
+    CurrentSeason,
+    SeasonIndex,
+    Season(SeasonRef),
+    Recommendations,
+    Latest,
+    Ongoing,
+    Search(String),
+    Detail(Origin),
+}
+
+impl Action {
+    fn loading_label(&self) -> String {
+        match self {
+            Self::Top => "Loading top anime…".to_string(),
+            Self::CurrentSeason => "Loading this season…".to_string(),
+            Self::SeasonIndex => "Loading seasons…".to_string(),
+            Self::Season(season) => format!("Loading {}…", season.label()),
+            Self::Recommendations => "Loading recommendations…".to_string(),
+            Self::Latest => "Loading latest releases…".to_string(),
+            Self::Ongoing => "Loading airing titles…".to_string(),
+            Self::Search(query) => format!("Searching for \"{query}\"…"),
+            Self::Detail(_) => "Loading details…".to_string(),
+        }
+    }
+}
+
+/// One entry in the home menu.
+struct HomeEntry {
+    label: &'static str,
+    choice: HomeChoice,
+}
+
+enum HomeChoice {
+    /// Needs the network, so it goes through the pending-action path.
+    Load(Action),
+    Search,
+    Quit,
 }
 
 pub(crate) struct App {
-    repository: CatalogRepository,
+    source: Source,
     pub(crate) screen: Screen,
-    pub(crate) previous_screen: Screen,
-    pub(crate) detail_origin: Screen,
-    pub(crate) quit_origin: Screen,
+    /// Screens to return to, innermost last.
+    history: Vec<Screen>,
     pub(crate) home_index: usize,
     pub(crate) list_index: usize,
     pub(crate) episode_index: usize,
-    pub(crate) latest: Vec<Anime>,
-    pub(crate) ongoing: Vec<Anime>,
-    pub(crate) search_results: Vec<Anime>,
+    pub(crate) season_index: usize,
+    pub(crate) listing_title: String,
+    pub(crate) listing: Vec<AnimeSummary>,
+    pub(crate) seasons: Vec<SeasonRef>,
     pub(crate) search_input: String,
-    pub(crate) selected_anime: Option<Anime>,
+    pub(crate) search_focus: SearchFocus,
+    pub(crate) search_submitted: Option<String>,
+    pub(crate) detail: Option<AnimeDetail>,
+    pub(crate) detail_scroll: u16,
+    pub(crate) error: Option<String>,
+    pending: Option<Action>,
+    pub(crate) loading: Option<String>,
 }
 
 impl App {
-    pub(crate) fn new(repository: CatalogRepository) -> Self {
+    pub(crate) fn new(source: Source) -> Self {
         Self {
-            repository,
+            source,
             screen: Screen::Home,
-            previous_screen: Screen::Home,
-            detail_origin: Screen::Home,
-            quit_origin: Screen::Home,
+            history: Vec::new(),
             home_index: 0,
             list_index: 0,
             episode_index: 0,
-            latest: Vec::new(),
-            ongoing: Vec::new(),
-            search_results: Vec::new(),
+            season_index: 0,
+            listing_title: String::new(),
+            listing: Vec::new(),
+            seasons: Vec::new(),
             search_input: String::new(),
-            selected_anime: None,
+            search_focus: SearchFocus::Query,
+            search_submitted: None,
+            detail: None,
+            detail_scroll: 0,
+            error: None,
+            pending: None,
+            loading: None,
         }
     }
 
-    /// The screen whose contents are on show. The quit prompt is an overlay, so
-    /// the screen it was raised from keeps rendering underneath it.
+    pub(crate) fn mode(&self) -> Mode {
+        self.source.mode()
+    }
+
+    /// The screen whose contents are on show. The quit prompt, the playback
+    /// notice, and errors are overlays, so the screen underneath keeps drawing.
     pub(crate) fn display_screen(&self) -> Screen {
         match self.screen {
-            Screen::QuitConfirm => self.quit_origin,
+            Screen::QuitConfirm | Screen::Error | Screen::PlaybackNotice => self
+                .history
+                .last()
+                .copied()
+                .filter(|screen| !matches!(screen, Screen::QuitConfirm | Screen::Error))
+                .unwrap_or(Screen::Home),
             screen => screen,
         }
     }
 
-    pub(crate) fn current_items(&self) -> &[Anime] {
-        match self.display_screen() {
-            Screen::Latest => &self.latest,
-            Screen::Ongoing => &self.ongoing,
-            Screen::Search => &self.search_results,
-            _ => &[],
+    pub(crate) fn is_busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The menu depends on the mode: the API-only screens are hidden when the
+    /// API is not in play.
+    fn home_entries(&self) -> Vec<HomeEntry> {
+        let mut entries = Vec::new();
+        if self.source.supports_live_listings() {
+            entries.push(HomeEntry {
+                label: "Top anime",
+                choice: HomeChoice::Load(Action::Top),
+            });
+            entries.push(HomeEntry {
+                label: "This season",
+                choice: HomeChoice::Load(Action::CurrentSeason),
+            });
+            entries.push(HomeEntry {
+                label: "Browse seasons",
+                choice: HomeChoice::Load(Action::SeasonIndex),
+            });
+            entries.push(HomeEntry {
+                label: "Recommendations",
+                choice: HomeChoice::Load(Action::Recommendations),
+            });
+        } else {
+            entries.push(HomeEntry {
+                label: "Latest releases",
+                choice: HomeChoice::Load(Action::Latest),
+            });
+        }
+        entries.push(HomeEntry {
+            label: "Airing now",
+            choice: HomeChoice::Load(Action::Ongoing),
+        });
+        entries.push(HomeEntry {
+            label: "Search",
+            choice: HomeChoice::Search,
+        });
+        entries.push(HomeEntry {
+            label: "Quit",
+            choice: HomeChoice::Quit,
+        });
+        entries
+    }
+
+    pub(crate) fn home_labels(&self) -> Vec<&'static str> {
+        self.home_entries()
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect()
+    }
+
+    /// Hands the queued action to the caller so the event loop can await it
+    /// after a frame has been drawn.
+    pub(crate) fn take_pending(&mut self) -> Option<Action> {
+        self.pending.take()
+    }
+
+    fn queue(&mut self, action: Action) {
+        self.loading = Some(action.loading_label());
+        self.pending = Some(action);
+    }
+
+    /// Performs one queued action. Failures become a dismissible overlay rather
+    /// than ending the session.
+    pub(crate) async fn run_action(&mut self, action: Action) -> Result<()> {
+        let outcome = self.perform(&action).await;
+        self.loading = None;
+        if let Err(error) = outcome {
+            self.error = Some(format!("{error:#}"));
+            self.enter(Screen::Error);
+        }
+        Ok(())
+    }
+
+    async fn perform(&mut self, action: &Action) -> Result<()> {
+        match action {
+            Action::Top => {
+                let rows = self.source.top(LISTING_LIMIT).await?;
+                self.show_listing("Top anime", rows);
+            }
+            Action::CurrentSeason => {
+                let rows = self.source.current_season(LISTING_LIMIT).await?;
+                self.show_listing("This season", rows);
+            }
+            Action::SeasonIndex => {
+                self.seasons = self.source.seasons_index().await?;
+                self.season_index = 0;
+                self.enter(Screen::SeasonPicker);
+            }
+            Action::Season(season) => {
+                let rows = self.source.season(season, LISTING_LIMIT).await?;
+                self.show_listing(&season.label(), rows);
+            }
+            Action::Recommendations => {
+                let rows = self.source.recommendations(LISTING_LIMIT).await?;
+                self.show_listing("Recommendations", rows);
+            }
+            Action::Latest => {
+                let rows = self.source.latest(LISTING_LIMIT).await?;
+                self.show_listing("Latest releases", rows);
+            }
+            Action::Ongoing => {
+                let rows = self.source.ongoing(LISTING_LIMIT).await?;
+                self.show_listing("Airing now", rows);
+            }
+            Action::Search(query) => {
+                self.listing = self.source.search(query, LISTING_LIMIT).await?;
+                self.search_submitted = Some(query.clone());
+                self.list_index = 0;
+                self.search_focus = if self.listing.is_empty() {
+                    SearchFocus::Query
+                } else {
+                    SearchFocus::Results
+                };
+            }
+            Action::Detail(origin) => {
+                let detail = self.source.detail(origin).await?;
+                self.detail_scroll = 0;
+                self.episode_index = 0;
+                let screen = match &detail {
+                    AnimeDetail::Live(_) => Screen::LiveDetail,
+                    AnimeDetail::Cached(anime) => match anime.kind {
+                        AnimeKind::Series => Screen::Episodes,
+                        AnimeKind::Movie => Screen::MovieDetail,
+                    },
+                };
+                self.detail = Some(detail);
+                self.enter(screen);
+            }
+        }
+        Ok(())
+    }
+
+    fn show_listing(&mut self, title: &str, rows: Vec<AnimeSummary>) {
+        self.listing_title = title.to_string();
+        self.listing = rows;
+        self.list_index = 0;
+        self.enter(Screen::Listing);
+    }
+
+    /// Moves to `screen`, remembering the current one for `Esc`.
+    fn enter(&mut self, screen: Screen) {
+        if self.screen != screen {
+            self.history.push(self.screen);
+            self.screen = screen;
         }
     }
 
-    pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(false);
+    fn go_back(&mut self) {
+        self.screen = self.history.pop().unwrap_or(Screen::Home);
+        if self.screen == Screen::Home {
+            self.history.clear();
         }
+    }
+
+    /// Returns `false` when the session should end.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Ok(true);
+            return !matches!(key.code, KeyCode::Char('c'));
         }
 
-        // The quit prompt swallows every other binding until it is answered.
-        if self.screen == Screen::QuitConfirm {
-            return Ok(self.handle_quit_confirm_key(key));
-        }
-
-        if self.screen == Screen::Search {
-            return self.handle_search_key(key).await;
+        match self.screen {
+            // These overlays swallow every other binding until answered.
+            Screen::QuitConfirm => return self.handle_quit_confirm_key(key),
+            Screen::Error => {
+                self.error = None;
+                self.go_back();
+                return true;
+            }
+            Screen::PlaybackNotice => {
+                self.go_back();
+                return true;
+            }
+            Screen::Search => return self.handle_search_key(key),
+            _ => {}
         }
 
         match key.code {
-            // `q` is reserved for the query text while Search has focus, but quits
-            // from every other screen so users are never forced through a menu path.
-            KeyCode::Char('q') => {
-                self.request_quit();
-                Ok(true)
-            }
-            KeyCode::Esc => {
-                self.go_back();
-                Ok(true)
-            }
-            KeyCode::Char('/') => {
-                self.enter_search();
-                Ok(true)
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                Ok(true)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
-                Ok(true)
-            }
-            KeyCode::Char('l') if self.screen == Screen::Home => {
-                self.open_latest().await?;
-                Ok(true)
-            }
-            KeyCode::Char('o') if self.screen == Screen::Home => {
-                self.open_ongoing().await?;
-                Ok(true)
-            }
-            KeyCode::Enter => self.select_current().await,
-            _ => Ok(true),
+            // `q` is reserved for the query text while Search has focus, but
+            // quits from every other screen.
+            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Esc => self.go_back(),
+            KeyCode::Char('/') => self.enter_search(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::Enter => self.select_current(),
+            _ => {}
         }
+        true
     }
 
-    /// Returns `false` once the user confirms the quit; every other key either
-    /// dismisses the prompt or is ignored.
     fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => false,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.screen = self.quit_origin;
+                self.go_back();
                 true
             }
             _ => true,
@@ -134,132 +350,144 @@ impl App {
     }
 
     fn request_quit(&mut self) {
-        self.quit_origin = self.screen;
-        self.screen = Screen::QuitConfirm;
+        self.enter(Screen::QuitConfirm);
     }
 
-    async fn handle_search_key(&mut self, key: KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => {
+    /// Live searches cost a request, so the query is submitted with `Enter`
+    /// rather than on every keystroke. Focus then drops into the results.
+    fn handle_search_key(&mut self, key: KeyEvent) -> bool {
+        match (self.search_focus, key.code) {
+            (_, KeyCode::Esc) if self.search_focus == SearchFocus::Results => {
+                self.search_focus = SearchFocus::Query;
+            }
+            (_, KeyCode::Esc) => {
                 self.search_input.clear();
-                self.search_results.clear();
+                self.search_submitted = None;
+                self.listing.clear();
                 self.list_index = 0;
-                self.screen = self.previous_screen;
-                Ok(true)
+                self.go_back();
             }
-            KeyCode::Backspace => {
+            (SearchFocus::Query, KeyCode::Enter) => {
+                let query = self.search_input.trim().to_string();
+                if !query.is_empty() {
+                    self.queue(Action::Search(query));
+                }
+            }
+            (SearchFocus::Query, KeyCode::Backspace) => {
                 self.search_input.pop();
-                self.refresh_search().await?;
-                Ok(true)
             }
-            KeyCode::Up => {
-                self.move_selection(-1);
-                Ok(true)
-            }
-            KeyCode::Down => {
-                self.move_selection(1);
-                Ok(true)
-            }
-            KeyCode::Enter => self.select_current().await,
-            KeyCode::Char(character) => {
+            (SearchFocus::Query, KeyCode::Char(character)) => {
                 self.search_input.push(character);
-                self.refresh_search().await?;
-                Ok(true)
             }
-            _ => Ok(true),
+            (SearchFocus::Query, KeyCode::Down) if !self.listing.is_empty() => {
+                self.search_focus = SearchFocus::Results;
+            }
+            (SearchFocus::Results, KeyCode::Enter) => self.select_current(),
+            (SearchFocus::Results, KeyCode::Char('/')) => {
+                self.search_focus = SearchFocus::Query;
+            }
+            (SearchFocus::Results, KeyCode::Up | KeyCode::Char('k')) => {
+                if self.list_index == 0 {
+                    self.search_focus = SearchFocus::Query;
+                } else {
+                    self.move_selection(-1);
+                }
+            }
+            (SearchFocus::Results, KeyCode::Down | KeyCode::Char('j')) => self.move_selection(1),
+            (SearchFocus::Results, KeyCode::PageUp) => self.move_selection(-10),
+            (SearchFocus::Results, KeyCode::PageDown) => self.move_selection(10),
+            _ => {}
         }
-    }
-
-    async fn open_latest(&mut self) -> Result<()> {
-        self.latest = self.repository.latest(usize::MAX).await?;
-        self.list_index = 0;
-        self.screen = Screen::Latest;
-        Ok(())
-    }
-
-    async fn open_ongoing(&mut self) -> Result<()> {
-        self.ongoing = self.repository.ongoing().await?;
-        self.list_index = 0;
-        self.screen = Screen::Ongoing;
-        Ok(())
+        true
     }
 
     fn enter_search(&mut self) {
-        self.previous_screen = self.screen;
         self.search_input.clear();
-        self.search_results.clear();
+        self.search_submitted = None;
+        self.listing.clear();
         self.list_index = 0;
-        self.screen = Screen::Search;
-    }
-
-    async fn refresh_search(&mut self) -> Result<()> {
-        self.search_results = self.repository.search(&self.search_input).await?;
-        self.list_index = 0;
-        Ok(())
+        self.search_focus = SearchFocus::Query;
+        self.enter(Screen::Search);
     }
 
     fn move_selection(&mut self, direction: isize) {
         match self.screen {
-            Screen::Home => move_index(&mut self.home_index, 4, direction),
-            Screen::Latest | Screen::Ongoing | Screen::Search => {
-                let count = self.current_items().len();
-                move_index(&mut self.list_index, count, direction)
+            Screen::Home => {
+                let count = self.home_entries().len();
+                move_index(&mut self.home_index, count, direction);
+            }
+            Screen::Listing | Screen::Search => {
+                let count = self.listing.len();
+                move_index(&mut self.list_index, count, direction);
+            }
+            Screen::SeasonPicker => {
+                let count = self.seasons.len();
+                move_index(&mut self.season_index, count, direction);
             }
             Screen::Episodes => {
-                let count = self
-                    .selected_anime
-                    .as_ref()
-                    .map_or(0, |anime| anime.episodes.len());
+                let count = self.cached_detail().map_or(0, |anime| anime.episodes.len());
                 move_index(&mut self.episode_index, count, direction);
+            }
+            Screen::LiveDetail => {
+                self.detail_scroll = if direction < 0 {
+                    self.detail_scroll
+                        .saturating_sub(direction.unsigned_abs() as u16)
+                } else {
+                    self.detail_scroll.saturating_add(direction as u16)
+                };
             }
             _ => {}
         }
     }
 
-    async fn select_current(&mut self) -> Result<bool> {
+    fn select_current(&mut self) {
         match self.screen {
-            Screen::Home => match self.home_index {
-                0 => self.open_latest().await?,
-                1 => self.open_ongoing().await?,
-                2 => self.enter_search(),
-                3 => self.request_quit(),
-                _ => unreachable!("home selection is bounded"),
-            },
-            Screen::Latest | Screen::Ongoing | Screen::Search => {
-                if let Some(anime) = self.current_items().get(self.list_index).cloned() {
-                    self.detail_origin = self.screen;
-                    self.selected_anime = Some(anime.clone());
-                    self.episode_index = 0;
-                    self.screen = match anime.kind {
-                        AnimeKind::Series => Screen::Episodes,
-                        AnimeKind::Movie => Screen::MovieDetail,
-                    };
+            Screen::Home => {
+                let mut entries = self.home_entries();
+                if self.home_index >= entries.len() {
+                    return;
+                }
+                match entries.remove(self.home_index).choice {
+                    HomeChoice::Load(action) => self.queue(action),
+                    HomeChoice::Search => self.enter_search(),
+                    HomeChoice::Quit => self.request_quit(),
                 }
             }
-            Screen::Episodes => {
-                self.previous_screen = Screen::Episodes;
-                self.screen = Screen::PlaybackNotice;
+            Screen::Listing | Screen::Search => {
+                if let Some(row) = self.listing.get(self.list_index) {
+                    self.queue(Action::Detail(row.origin.clone()));
+                }
             }
-            Screen::MovieDetail => {
-                self.previous_screen = Screen::MovieDetail;
-                self.screen = Screen::PlaybackNotice;
+            Screen::SeasonPicker => {
+                if let Some(season) = self.seasons.get(self.season_index).cloned() {
+                    self.queue(Action::Season(season));
+                }
             }
-            Screen::PlaybackNotice => self.screen = self.previous_screen,
-            // Answered by `handle_quit_confirm_key`, which runs before this.
-            Screen::QuitConfirm => {}
+            Screen::Episodes | Screen::MovieDetail | Screen::LiveDetail => {
+                self.enter(Screen::PlaybackNotice);
+            }
+            _ => {}
         }
-        Ok(true)
     }
 
-    fn go_back(&mut self) {
-        match self.screen {
-            Screen::Home => {}
-            Screen::Latest | Screen::Ongoing => self.screen = Screen::Home,
-            Screen::Search => self.screen = self.previous_screen,
-            Screen::Episodes | Screen::MovieDetail => self.screen = self.detail_origin,
-            Screen::PlaybackNotice => self.screen = self.previous_screen,
-            Screen::QuitConfirm => self.screen = self.quit_origin,
+    pub(crate) fn cached_detail(&self) -> Option<&crate::catalog::Anime> {
+        match self.detail.as_ref()? {
+            AnimeDetail::Cached(anime) => Some(anime),
+            AnimeDetail::Live(_) => None,
         }
+    }
+
+    pub(crate) fn live_detail(&self) -> Option<&crate::live::LiveAnime> {
+        match self.detail.as_ref()? {
+            AnimeDetail::Live(anime) => Some(anime),
+            AnimeDetail::Cached(_) => None,
+        }
+    }
+
+    /// Keeps the detail scroll inside the rendered content; the renderer knows
+    /// the wrapped height, the key handler does not.
+    pub(crate) fn clamp_detail_scroll(&mut self, max: u16) {
+        self.detail_scroll = self.detail_scroll.min(max);
     }
 }
 
@@ -267,9 +495,9 @@ fn move_index(index: &mut usize, count: usize, direction: isize) {
     if count == 0 {
         *index = 0;
     } else if direction < 0 {
-        *index = index.saturating_sub(1);
+        *index = index.saturating_sub(direction.unsigned_abs());
     } else {
-        *index = (*index + 1).min(count - 1);
+        *index = (*index + direction as usize).min(count - 1);
     }
 }
 
@@ -285,5 +513,16 @@ mod tests {
         move_index(&mut index, 2, 1);
         move_index(&mut index, 2, 1);
         assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn paging_clamps_to_the_ends() {
+        let mut index = 0;
+        move_index(&mut index, 5, 10);
+        assert_eq!(index, 4);
+        move_index(&mut index, 5, -10);
+        assert_eq!(index, 0);
+        move_index(&mut index, 0, 1);
+        assert_eq!(index, 0);
     }
 }

@@ -1,6 +1,7 @@
-use crate::catalog::{Anime, CatalogRepository};
+use crate::mode::{MODE_ENV, Mode, resolve_mode};
+use crate::source::{AnimeSummary, SeasonRef, Source};
 use crate::tui;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::path::PathBuf;
@@ -8,10 +9,14 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "termuto",
-    about = "Browse a local anime catalog from the terminal",
+    about = "Browse anime from the terminal, live from the Tenrai API or from a local catalog",
     version
 )]
 pub struct Cli {
+    /// Where titles are read from (defaults to TERMUTO_MODE or live)
+    #[arg(long, global = true, value_name = "MODE", value_enum)]
+    pub mode: Option<Mode>,
+
     /// Path to the Deeb JSON catalog (defaults to TERMUTO_CATALOG or ~/.termuto/catalog.json)
     #[arg(long, global = true, value_name = "PATH")]
     pub catalog: Option<PathBuf>,
@@ -24,42 +29,110 @@ pub struct Cli {
 pub enum Command {
     /// Launch the interactive terminal UI
     Tui,
-    /// List titles by newest release first
+    /// List the highest ranked titles (live and hybrid modes)
+    Top {
+        /// Maximum number of titles to show
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// List a broadcast season, defaulting to the one airing now
+    Season {
+        /// Season year, e.g. 2023 (requires --season)
+        #[arg(long)]
+        year: Option<u32>,
+        /// winter, spring, summer, or fall (requires --year)
+        #[arg(long, value_name = "SEASON")]
+        season: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// List the years and seasons the API holds titles for
+    Seasons,
+    /// List recent user recommendations (live and hybrid modes)
+    Recommendations {
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// List newest titles: the current season live, newest releases cached
     Latest {
         /// Maximum number of titles to show
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
-    /// Search titles and alternative titles (case-insensitive)
-    Search { query: String },
-    /// List ongoing titles by newest release first
-    Ongoing,
+    /// Search titles (case-insensitive)
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// List titles that are still airing
+    Ongoing {
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let catalog_path = resolve_catalog_path(cli.catalog);
-    let repository = CatalogRepository::open(catalog_path).await?;
+    let mode = resolve_mode(cli.mode).map_err(|message| anyhow!(message))?;
+    let source = Source::open(mode, resolve_catalog_path(cli.catalog)).await?;
+    if let Some(issue) = source.catalog_issue() {
+        eprintln!("warning: continuing without the local catalog — {issue}");
+    }
 
     match cli.command {
-        None | Some(Command::Tui) => tui::run(repository).await,
-        Some(Command::Latest { limit }) => {
-            let anime = repository.latest(limit).await?;
-            print_listing("Latest releases", &anime, true);
+        None | Some(Command::Tui) => tui::run(source).await,
+        Some(Command::Top { limit }) => {
+            print_listing(&format!("Top anime ({mode})"), &source.top(limit).await?);
             Ok(())
         }
-        Some(Command::Search { query }) => {
-            let anime = repository.search(&query).await?;
+        Some(Command::Season {
+            year,
+            season,
+            limit,
+        }) => {
+            let (heading, anime) = match (year, season) {
+                (Some(year), Some(season)) => {
+                    let season = SeasonRef { year, season };
+                    let anime = source.season(&season, limit).await?;
+                    (season.label(), anime)
+                }
+                (None, None) => (
+                    "Current season".to_string(),
+                    source.current_season(limit).await?,
+                ),
+                _ => bail_season_arguments()?,
+            };
+            print_listing(&heading, &anime);
+            Ok(())
+        }
+        Some(Command::Seasons) => {
+            let seasons = source.seasons_index().await?;
+            println!("Available seasons\n");
+            for season in &seasons {
+                println!("{:<6}{}", season.year, season.season);
+            }
+            Ok(())
+        }
+        Some(Command::Recommendations { limit }) => {
+            print_listing("Recommendations", &source.recommendations(limit).await?);
+            Ok(())
+        }
+        Some(Command::Latest { limit }) => {
+            print_listing("Latest releases", &source.latest(limit).await?);
+            Ok(())
+        }
+        Some(Command::Search { query, limit }) => {
+            let anime = source.search(&query, limit).await?;
             if anime.is_empty() {
                 println!("No anime found for \"{}\".", query.trim());
             } else {
                 println!("{} results for \"{}\"\n", anime.len(), query.trim());
-                print_rows(&anime, false);
+                print_rows(&anime);
             }
             Ok(())
         }
-        Some(Command::Ongoing) => {
-            let anime = repository.ongoing().await?;
-            print_listing("Ongoing", &anime, true);
+        Some(Command::Ongoing { limit }) => {
+            print_listing("Ongoing", &source.ongoing(limit).await?);
             Ok(())
         }
     }
@@ -79,37 +152,31 @@ fn default_catalog_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("catalog.json"))
 }
 
-fn print_listing(heading: &str, anime: &[Anime], show_release: bool) {
-    println!("{heading}\n");
-    print_rows(anime, show_release);
+fn bail_season_arguments() -> Result<(String, Vec<AnimeSummary>)> {
+    Err(anyhow!(
+        "--year and --season go together. Pass both, or neither for the current season. \
+         Run `termuto seasons` to see what is available."
+    ))
 }
 
-fn print_rows(anime: &[Anime], show_release: bool) {
-    if show_release {
-        println!(
-            "{:<38}  {:<10}  {:<11}  RELEASED",
-            "TITLE", "TYPE", "STATUS"
-        );
-        for entry in anime {
-            println!(
-                "{:<38}  {:<10}  {:<11}  {}",
-                entry.title,
-                entry.kind,
-                entry.status,
-                release_date(entry)
-            );
-        }
-    } else {
-        println!("{:<38}  {:<10}  STATUS", "TITLE", "TYPE");
-        for entry in anime {
-            println!("{:<38}  {:<10}  {}", entry.title, entry.kind, entry.status);
+fn print_listing(heading: &str, anime: &[AnimeSummary]) {
+    println!("{heading}\n");
+    if anime.is_empty() {
+        println!("Nothing to show. Mode is set by --mode or {MODE_ENV}.");
+        return;
+    }
+    print_rows(anime);
+}
+
+fn print_rows(anime: &[AnimeSummary]) {
+    // Title-only listings, such as recommendations, have no columns to head.
+    if !anime.iter().all(AnimeSummary::is_bare) {
+        println!("{}", AnimeSummary::header());
+    }
+    for entry in anime {
+        println!("{}", entry.row());
+        if let Some(note) = &entry.note {
+            println!("  ↳ {note}");
         }
     }
-}
-
-pub fn release_date(anime: &Anime) -> String {
-    anime
-        .latest_release_at
-        .map(|date| date.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "—".to_string())
 }

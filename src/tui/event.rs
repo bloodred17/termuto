@@ -11,10 +11,17 @@ pub(crate) async fn run(
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
 
+        // A queued action runs only after the loading frame above is on screen,
+        // so a slow API call shows progress instead of a frozen UI.
+        if let Some(action) = app.take_pending() {
+            app.run_action(action).await?;
+            continue;
+        }
+
         if event::poll(Duration::from_millis(250)).context("Could not poll terminal events")?
             && let Event::Key(key) = event::read().context("Could not read a terminal event")?
             && key.kind == KeyEventKind::Press
-            && !app.handle_key(key).await?
+            && !app.handle_key(key)
         {
             return Ok(());
         }

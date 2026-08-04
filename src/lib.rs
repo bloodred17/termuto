@@ -2,4 +2,7 @@
 
 pub mod catalog;
 pub mod cli;
+pub mod live;
+pub mod mode;
+pub mod source;
 pub mod tui;
