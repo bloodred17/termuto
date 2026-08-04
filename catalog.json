@@ -1,0 +1,55 @@
+{
+  "anime": {
+    "solo-leveling-season-2": {
+      "id": "solo-leveling-season-2",
+      "title": "Solo Leveling Season 2",
+      "alternative_titles": [
+        "Ore dake Level Up na Ken Season 2"
+      ],
+      "kind": "series",
+      "status": "ongoing",
+      "latest_release_at": "2026-08-03T18:30:00Z",
+      "description": "Sample series used by the proof of concept.",
+      "episodes": [
+        {
+          "number": 1,
+          "title": "Episode 1",
+          "released_at": "2026-07-20T18:30:00Z"
+        },
+        {
+          "number": 2,
+          "title": "Episode 2",
+          "released_at": "2026-07-27T18:30:00Z"
+        }
+      ]
+    },
+    "frieren": {
+      "id": "frieren",
+      "title": "Frieren: Beyond Journey's End",
+      "alternative_titles": [
+        "Sousou no Frieren"
+      ],
+      "kind": "series",
+      "status": "completed",
+      "latest_release_at": "2026-07-28T18:30:00Z",
+      "description": "Another sample series.",
+      "episodes": [
+        {
+          "number": 1,
+          "title": "The Journey's End",
+          "released_at": "2026-07-01T18:30:00Z"
+        }
+      ]
+    },
+    "look-back": {
+      "id": "look-back",
+      "title": "Look Back",
+      "alternative_titles": [],
+      "kind": "movie",
+      "status": "completed",
+      "latest_release_at": "2026-07-15T00:00:00Z",
+      "description": "Sample movie used by the proof of concept.",
+      "episodes": []
+    }
+  }
+}

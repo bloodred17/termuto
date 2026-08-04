@@ -1,0 +1,26 @@
+[package]
+name = "termuto-poc"
+version = "0.1.0"
+edition = "2024"
+description = "A small terminal anime catalog proof of concept"
+license = "MIT"
+
+[[bin]]
+name = "termuto"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+deeb = "0.0.13"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serde_json = "1"
+tempfile = "3"
