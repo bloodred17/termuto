@@ -62,6 +62,12 @@ impl Source {
         self.catalog_issue.as_deref()
     }
 
+    /// The open catalog, when the mode has one. Playback needs it to read the
+    /// `source` a catalog row plays from.
+    pub fn catalog(&self) -> Option<&CatalogRepository> {
+        self.catalog.as_ref()
+    }
+
     /// Whether the API-only listings (top, seasonal, recommendations) can be served.
     pub fn supports_live_listings(&self) -> bool {
         self.live.is_some()

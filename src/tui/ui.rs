@@ -24,8 +24,9 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(
         Paragraph::new(format!(
-            "termuto — anime from the terminal · mode: {}",
-            app.mode()
+            "termuto — anime from the terminal · mode: {} · player: {}",
+            app.mode(),
+            app.player_name()
         ))
         .block(Block::default().borders(Borders::ALL).title(" termuto "))
         .alignment(Alignment::Center),
@@ -39,13 +40,14 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Screen::Search => render_search(frame, app, chunks[1]),
         Screen::LiveDetail => render_live_detail(frame, app, chunks[1]),
         Screen::Episodes => render_episodes(frame, app, chunks[1]),
+        Screen::LiveEpisodes => render_live_episodes(frame, app, chunks[1]),
         Screen::MovieDetail => render_movie(frame, app, chunks[1]),
         // Overlay screens never reach `display_screen`.
-        Screen::PlaybackNotice | Screen::QuitConfirm | Screen::Error => {}
+        Screen::Playing | Screen::QuitConfirm | Screen::Error => {}
     }
 
     match app.screen {
-        Screen::PlaybackNotice => render_playback_notice(frame, chunks[1]),
+        Screen::Playing => render_now_playing(frame, app, chunks[1]),
         Screen::QuitConfirm => render_quit_confirm(frame, chunks[1]),
         Screen::Error => render_error(frame, app, chunks[1]),
         _ => {}
@@ -180,6 +182,24 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// `/anime/{id}/full` carries an episode count, not an episode list, so the
+/// numbers are counted out and each one is playable.
+fn render_live_episodes(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(anime) = app.live_detail() else {
+        return;
+    };
+    let items = (1..=app.live_episode_count())
+        .map(|number| ListItem::new(format!("{number:>3}  Episode {number}")))
+        .collect::<Vec<_>>();
+    render_list(
+        frame,
+        area,
+        &format!("{} — episodes", anime.display_title()),
+        items,
+        app.episode_index,
+    );
+}
+
 fn render_movie(frame: &mut Frame, app: &App, area: Rect) {
     let Some(anime) = app.cached_detail() else {
         return;
@@ -211,7 +231,7 @@ fn cached_movie_lines(anime: &Anime) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(anime.description.clone()),
         Line::from(""),
-        Line::from("Press Enter for the future play action."),
+        Line::from("Press Enter to play."),
     ]
 }
 
@@ -349,20 +369,71 @@ fn live_detail_lines(anime: &LiveAnime, width: usize) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from("Press Enter for the future play action."));
+    lines.push(Line::from(if anime.is_movie() {
+        "Press Enter to play.".to_string()
+    } else {
+        "Press Enter to choose an episode.".to_string()
+    }));
     lines
 }
 
-fn render_playback_notice(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 25, area);
+/// The player runs detached, so this reports what was handed over rather than
+/// tracking playback — once mpv has the stream, termuto is no longer involved.
+fn render_now_playing(frame: &mut Frame, app: &App, area: Rect) {
+    // A stream URL is long enough to wrap, so the entries are wrapped here and
+    // the popup is sized to the result. A fixed height silently cuts off the
+    // last lines, which are the ones worth reading when nothing plays.
+    let width = percent_of(area.width, 78).max(20);
+    let inner = width.saturating_sub(2).max(10) as usize;
+
+    let mut lines = Vec::new();
+    for (index, entry) in app.now_playing.iter().flatten().enumerate() {
+        if index == 0 {
+            lines.extend(wrap_text(entry, inner).into_iter().map(|chunk| {
+                Line::from(Span::styled(
+                    chunk,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            }));
+        } else {
+            lines.extend(wrapped(entry, inner));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Press any key to return."));
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = centered(width, height, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new("Playback is not implemented in this proof of concept.\n\nPress Enter or Esc to return.")
+        Paragraph::new(lines)
             .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title(" Playback "))
-            .wrap(Wrap { trim: true }),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Now playing ")
+                    .border_style(Style::default().fg(Color::Green)),
+            ),
         popup,
     );
+}
+
+fn percent_of(total: u16, percent: u16) -> u16 {
+    (u32::from(total) * u32::from(percent) / 100) as u16
+}
+
+/// A popup of an exact size, centered in `area` and never larger than it.
+fn centered(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 fn render_quit_confirm(frame: &mut Frame, area: Rect) {
@@ -473,11 +544,11 @@ fn help_text(app: &App) -> &'static str {
         Screen::Home => "↑/↓ select • Enter open • / Search • q Quit",
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
         Screen::SeasonPicker => "↑/↓ or j/k select • Enter open season • Esc back • q Quit",
-        Screen::LiveDetail => "↑/↓ or j/k scroll • PgUp/PgDn page • Enter play action • Esc back",
-        Screen::Episodes | Screen::MovieDetail => {
-            "↑/↓ or j/k select • Enter play action • Esc back"
+        Screen::LiveDetail => "↑/↓ or j/k scroll • PgUp/PgDn page • Enter play • Esc back",
+        Screen::Episodes | Screen::LiveEpisodes | Screen::MovieDetail => {
+            "↑/↓ or j/k select • Enter play • Esc back"
         }
-        Screen::PlaybackNotice => "Enter or Esc back",
+        Screen::Playing => "Any key to dismiss",
         Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         Screen::Error => "Any key to dismiss",
         Screen::Listing => "↑/↓ or j/k select • Enter open • / Search • Esc back • q Quit",

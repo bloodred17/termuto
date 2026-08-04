@@ -176,6 +176,7 @@ mod tests {
                 status: AnimeStatus::Upcoming,
                 latest_release_at: None,
                 description: String::new(),
+                source: None,
                 episodes: vec![],
             },
             Anime {
@@ -186,6 +187,7 @@ mod tests {
                 status: AnimeStatus::Completed,
                 latest_release_at: Some("2026-08-01T00:00:00Z".parse().expect("valid date")),
                 description: String::new(),
+                source: None,
                 episodes: vec![],
             },
         ];

@@ -4,5 +4,6 @@ pub mod catalog;
 pub mod cli;
 pub mod live;
 pub mod mode;
+pub mod playback;
 pub mod source;
 pub mod tui;

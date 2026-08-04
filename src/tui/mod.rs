@@ -4,6 +4,7 @@ mod app;
 mod event;
 mod ui;
 
+use crate::playback::Playback;
 use crate::source::Source;
 use anyhow::{Context, Result};
 use crossterm::{
@@ -13,9 +14,9 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Stdout};
 
-pub async fn run(source: Source) -> Result<()> {
+pub async fn run(source: Source, playback: Playback) -> Result<()> {
     let mut terminal = TerminalGuard::new()?;
-    let mut app = app::App::new(source);
+    let mut app = app::App::new(source, playback);
     let event_result = event::run(&mut terminal.terminal, &mut app).await;
     let restore_result = terminal.restore();
 

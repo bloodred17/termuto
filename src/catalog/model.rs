@@ -20,6 +20,11 @@ pub struct Anime {
     #[serde(default)]
     pub latest_release_at: Option<DateTime<Utc>>,
     pub description: String,
+    /// Where a movie plays from: a local path or a URL. Series carry this per
+    /// episode instead. Absent means the entry is metadata only, and playback
+    /// falls through to the next provider.
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub episodes: Vec<Episode>,
 }
@@ -30,6 +35,9 @@ pub struct Episode {
     pub title: String,
     #[serde(default)]
     pub released_at: Option<DateTime<Utc>>,
+    /// Where this episode plays from: a local path or a URL.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

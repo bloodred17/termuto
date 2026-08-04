@@ -7,11 +7,16 @@ fn catalog_path() -> PathBuf {
 }
 
 /// Every test here runs offline, so the mode is pinned rather than left to the
-/// `live` default. `TERMUTO_MODE` is cleared so an exported value cannot change
+/// `live` default. The environment is cleared so an exported value cannot change
 /// what is being asserted.
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_termuto"));
-    command.env_remove("TERMUTO_MODE").env_remove("TERMUTO_CATALOG");
+    command
+        .env_remove("TERMUTO_MODE")
+        .env_remove("TERMUTO_CATALOG")
+        .env_remove("TERMUTO_PLAYER")
+        .env_remove("TERMUTO_AUDIO")
+        .env_remove("TERMUTO_QUALITY");
     command
 }
 
@@ -100,4 +105,92 @@ fn season_arguments_must_be_given_together() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--year and --season go together"));
+}
+
+/// `true` stands in for a media player: it accepts any arguments and exits at
+/// once, so playback is exercised end to end without opening a window.
+fn playable() -> Command {
+    let mut command = cached();
+    command.args(["--player", "true"]);
+    command
+}
+
+#[test]
+fn playing_a_catalog_episode_uses_the_source_the_catalog_points_at() {
+    playable()
+        .args(["play", "solo", "--episode", "2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Solo Leveling Season 2 episode 2",
+        ))
+        .stdout(predicate::str::contains("via catalog"))
+        .stdout(predicate::str::contains(
+            "media/solo-leveling-season-2/02.mkv",
+        ));
+}
+
+#[test]
+fn a_catalog_movie_plays_without_an_episode_number() {
+    playable()
+        .args(["play", "look back"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Playing Look Back via catalog"))
+        .stdout(predicate::str::contains("media/look-back.mkv"));
+}
+
+/// `frieren` carries no `source`, so the catalog provider declines and the next
+/// provider in the chain answers instead.
+#[test]
+fn a_catalog_row_without_a_source_falls_through_to_the_next_provider() {
+    playable()
+        .args(["play", "frieren"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("via mock"));
+}
+
+#[test]
+fn playing_an_episode_the_catalog_does_not_have_is_an_error() {
+    playable()
+        .args(["play", "solo", "--episode", "99"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has no episode 99"));
+}
+
+#[test]
+fn a_missing_player_names_itself_and_how_to_change_it() {
+    cached()
+        .args(["--player", "definitely-not-a-player", "play", "solo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("definitely-not-a-player"))
+        .stderr(predicate::str::contains("TERMUTO_PLAYER"));
+}
+
+#[test]
+fn an_unknown_quality_is_rejected() {
+    cached()
+        .args(["--quality", "ultra", "play", "solo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ultra"));
+
+    command()
+        .env("TERMUTO_QUALITY", "ultra")
+        .args(["--mode", "cached", "latest"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TERMUTO_QUALITY is invalid"));
+}
+
+#[test]
+fn playing_something_the_catalog_does_not_have_is_an_error() {
+    playable()
+        .args(["play", "not a title"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No anime found"));
 }

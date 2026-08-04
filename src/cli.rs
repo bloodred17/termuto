@@ -1,7 +1,9 @@
+use crate::catalog::AnimeKind;
 use crate::mode::{MODE_ENV, Mode, resolve_mode};
-use crate::source::{AnimeSummary, SeasonRef, Source};
+use crate::playback::{Audio, Playback, Quality, resolve_player, resolve_prefs};
+use crate::source::{AnimeDetail, AnimeSummary, SeasonRef, Source};
 use crate::tui;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::path::PathBuf;
@@ -20,6 +22,18 @@ pub struct Cli {
     /// Path to the Deeb JSON catalog (defaults to TERMUTO_CATALOG or ~/.termuto/catalog.json)
     #[arg(long, global = true, value_name = "PATH")]
     pub catalog: Option<PathBuf>,
+
+    /// Which audio track playback asks for (defaults to TERMUTO_AUDIO or sub)
+    #[arg(long, global = true, value_name = "AUDIO", value_enum)]
+    pub audio: Option<Audio>,
+
+    /// Preferred rendition, e.g. 1080 or best (defaults to TERMUTO_QUALITY or best)
+    #[arg(long, global = true, value_name = "QUALITY")]
+    pub quality: Option<Quality>,
+
+    /// Player to hand streams to (defaults to TERMUTO_PLAYER or mpv)
+    #[arg(long, global = true, value_name = "PLAYER")]
+    pub player: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -70,17 +84,26 @@ pub enum Command {
         #[arg(long, default_value_t = 25)]
         limit: usize,
     },
+    /// Resolve a stream for the best match of QUERY and open it in the player
+    Play {
+        query: String,
+        /// Episode number, defaulting to the first (ignored for a movie)
+        #[arg(long, value_name = "N")]
+        episode: Option<u32>,
+    },
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
     let mode = resolve_mode(cli.mode).map_err(|message| anyhow!(message))?;
+    let prefs = resolve_prefs(cli.audio, cli.quality).map_err(|message| anyhow!(message))?;
     let source = Source::open(mode, resolve_catalog_path(cli.catalog)).await?;
     if let Some(issue) = source.catalog_issue() {
         eprintln!("warning: continuing without the local catalog — {issue}");
     }
+    let playback = Playback::for_source(&source, prefs, resolve_player(cli.player));
 
     match cli.command {
-        None | Some(Command::Tui) => tui::run(source).await,
+        None | Some(Command::Tui) => tui::run(source, playback).await,
         Some(Command::Top { limit }) => {
             print_listing(&format!("Top anime ({mode})"), &source.top(limit).await?);
             Ok(())
@@ -135,7 +158,70 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_listing("Ongoing", &source.ongoing(limit).await?);
             Ok(())
         }
+        Some(Command::Play { query, episode }) => play(source, playback, &query, episode).await,
     }
+}
+
+/// Plays the best match for `query`. The match is the first search result, which
+/// is reported so a wrong guess is obvious rather than silent.
+async fn play(
+    source: Source,
+    mut playback: Playback,
+    query: &str,
+    episode: Option<u32>,
+) -> Result<()> {
+    let matches = source.search(query, 1).await?;
+    let Some(row) = matches.first() else {
+        bail!("No anime found for \"{}\".", query.trim());
+    };
+
+    // The detail decides whether an episode number applies at all, and gives the
+    // title the player is labelled with.
+    let detail = source.detail(&row.origin).await?;
+    let (title, episode) = match &detail {
+        AnimeDetail::Cached(anime) => match anime.kind {
+            AnimeKind::Movie => (anime.title.clone(), None),
+            AnimeKind::Series => {
+                let number = episode.unwrap_or(1);
+                if !anime.episodes.iter().any(|entry| entry.number == number) {
+                    bail!(
+                        "\"{}\" has no episode {number}. The catalog lists {}.",
+                        anime.title,
+                        episode_range(anime.episodes.iter().map(|entry| entry.number))
+                    );
+                }
+                (anime.title.clone(), Some(number))
+            }
+        },
+        AnimeDetail::Live(anime) => {
+            if anime.is_movie() {
+                (anime.display_title().to_string(), None)
+            } else {
+                let number = episode.unwrap_or(1);
+                // The API knows a count, not a list; an unknown count is not
+                // grounds to refuse a number.
+                if let Some(count) = anime.episodes
+                    && (number == 0 || number > count)
+                {
+                    bail!(
+                        "\"{}\" has no episode {number}. It has {count}.",
+                        anime.display_title()
+                    );
+                }
+                (anime.display_title().to_string(), Some(number))
+            }
+        }
+    };
+
+    let request = playback.request(row.origin.clone(), title, episode);
+    println!("Resolving {}…", request.label());
+    let label = request.label();
+    let stream = playback.play(request).await?;
+    println!("Playing {label} via {stream} in {}", playback.player_name());
+    println!("{}", stream.url);
+    // The player is detached, so anything it rejects fails after this returns.
+    println!("Player output: {}", playback.log_path().display());
+    Ok(())
 }
 
 pub fn resolve_catalog_path(option: Option<PathBuf>) -> PathBuf {
@@ -150,6 +236,28 @@ fn default_catalog_path() -> PathBuf {
     env::home_dir()
         .map(|home| home.join(".termuto").join("catalog.json"))
         .unwrap_or_else(|| PathBuf::from("catalog.json"))
+}
+
+/// The episode numbers a title holds, as `1–12` when they run consecutively and
+/// as a plain list when they do not.
+fn episode_range(numbers: impl Iterator<Item = u32>) -> String {
+    let mut numbers: Vec<u32> = numbers.collect();
+    numbers.sort_unstable();
+    match numbers.as_slice() {
+        [] => "no episodes".to_string(),
+        [only] => format!("episode {only}"),
+        [first, .., last] if (*last - *first) as usize + 1 == numbers.len() => {
+            format!("episodes {first}–{last}")
+        }
+        _ => format!(
+            "episodes {}",
+            numbers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn bail_season_arguments() -> Result<(String, Vec<AnimeSummary>)> {

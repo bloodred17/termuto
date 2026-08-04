@@ -1,5 +1,6 @@
 use crate::catalog::AnimeKind;
 use crate::mode::Mode;
+use crate::playback::{Playback, StreamRequest};
 use crate::source::{AnimeDetail, AnimeSummary, Origin, SeasonRef, Source};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -20,9 +21,13 @@ pub(crate) enum Screen {
     LiveDetail,
     /// A catalog series and its episodes.
     Episodes,
+    /// The episodes of a live series. The API gives a count rather than a list,
+    /// so the numbers are counted out rather than fetched.
+    LiveEpisodes,
     /// A catalog movie.
     MovieDetail,
-    PlaybackNotice,
+    /// Raised once the player has been handed a resolved stream.
+    Playing,
     QuitConfirm,
     /// Raised over whatever was on screen when a request failed.
     Error,
@@ -48,6 +53,8 @@ pub(crate) enum Action {
     Ongoing,
     Search(String),
     Detail(Origin),
+    /// Resolving a stream can take as long as a listing, so it queues like one.
+    Play(StreamRequest),
 }
 
 impl Action {
@@ -62,6 +69,7 @@ impl Action {
             Self::Ongoing => "Loading airing titles…".to_string(),
             Self::Search(query) => format!("Searching for \"{query}\"…"),
             Self::Detail(_) => "Loading details…".to_string(),
+            Self::Play(request) => format!("Resolving {}…", request.label()),
         }
     }
 }
@@ -81,6 +89,7 @@ enum HomeChoice {
 
 pub(crate) struct App {
     source: Source,
+    playback: Playback,
     pub(crate) screen: Screen,
     /// Screens to return to, innermost last.
     history: Vec<Screen>,
@@ -97,14 +106,18 @@ pub(crate) struct App {
     pub(crate) detail: Option<AnimeDetail>,
     pub(crate) detail_scroll: u16,
     pub(crate) error: Option<String>,
+    /// What the last successful play handed to the player, shown on
+    /// [`Screen::Playing`].
+    pub(crate) now_playing: Option<Vec<String>>,
     pending: Option<Action>,
     pub(crate) loading: Option<String>,
 }
 
 impl App {
-    pub(crate) fn new(source: Source) -> Self {
+    pub(crate) fn new(source: Source, playback: Playback) -> Self {
         Self {
             source,
+            playback,
             screen: Screen::Home,
             history: Vec::new(),
             home_index: 0,
@@ -120,6 +133,7 @@ impl App {
             detail: None,
             detail_scroll: 0,
             error: None,
+            now_playing: None,
             pending: None,
             loading: None,
         }
@@ -129,15 +143,21 @@ impl App {
         self.source.mode()
     }
 
-    /// The screen whose contents are on show. The quit prompt, the playback
-    /// notice, and errors are overlays, so the screen underneath keeps drawing.
+    pub(crate) fn player_name(&self) -> &str {
+        self.playback.player_name()
+    }
+
+    /// The screen whose contents are on show. The quit prompt, the now-playing
+    /// panel, and errors are overlays, so the screen underneath keeps drawing.
     pub(crate) fn display_screen(&self) -> Screen {
         match self.screen {
-            Screen::QuitConfirm | Screen::Error | Screen::PlaybackNotice => self
+            Screen::QuitConfirm | Screen::Error | Screen::Playing => self
                 .history
                 .last()
                 .copied()
-                .filter(|screen| !matches!(screen, Screen::QuitConfirm | Screen::Error))
+                .filter(|screen| {
+                    !matches!(screen, Screen::QuitConfirm | Screen::Error | Screen::Playing)
+                })
                 .unwrap_or(Screen::Home),
             screen => screen,
         }
@@ -274,6 +294,18 @@ impl App {
                 self.detail = Some(detail);
                 self.enter(screen);
             }
+            Action::Play(request) => {
+                let label = request.label();
+                let stream = self.playback.play(request.clone()).await?;
+                self.now_playing = Some(vec![
+                    label,
+                    format!("via {stream}"),
+                    format!("in {}", self.playback.player_name()),
+                    stream.url,
+                    format!("Player output: {}", self.playback.log_path().display()),
+                ]);
+                self.enter(Screen::Playing);
+            }
         }
         Ok(())
     }
@@ -314,7 +346,8 @@ impl App {
                 self.go_back();
                 return true;
             }
-            Screen::PlaybackNotice => {
+            Screen::Playing => {
+                self.now_playing = None;
                 self.go_back();
                 return true;
             }
@@ -428,6 +461,10 @@ impl App {
                 let count = self.cached_detail().map_or(0, |anime| anime.episodes.len());
                 move_index(&mut self.episode_index, count, direction);
             }
+            Screen::LiveEpisodes => {
+                let count = self.live_episode_count();
+                move_index(&mut self.episode_index, count, direction);
+            }
             Screen::LiveDetail => {
                 self.detail_scroll = if direction < 0 {
                     self.detail_scroll
@@ -463,11 +500,67 @@ impl App {
                     self.queue(Action::Season(season));
                 }
             }
-            Screen::Episodes | Screen::MovieDetail | Screen::LiveDetail => {
-                self.enter(Screen::PlaybackNotice);
+            // A catalog series plays the highlighted episode; a movie has none.
+            Screen::Episodes => {
+                let Some(anime) = self.cached_detail() else {
+                    return;
+                };
+                let Some(episode) = anime.episodes.get(self.episode_index) else {
+                    return;
+                };
+                let request = self.playback.request(
+                    Origin::Cached(anime.id.clone()),
+                    anime.title.clone(),
+                    Some(episode.number),
+                );
+                self.queue(Action::Play(request));
+            }
+            Screen::MovieDetail => {
+                let Some(anime) = self.cached_detail() else {
+                    return;
+                };
+                let request =
+                    self.playback
+                        .request(Origin::Cached(anime.id.clone()), anime.title.clone(), None);
+                self.queue(Action::Play(request));
+            }
+            // A live movie plays straight away; a series needs an episode first.
+            Screen::LiveDetail => {
+                let Some(anime) = self.live_detail() else {
+                    return;
+                };
+                if anime.is_movie() || self.live_episode_count() <= 1 {
+                    let request = self.playback.request(
+                        Origin::Live(anime.mal_id),
+                        anime.display_title().to_string(),
+                        (!anime.is_movie()).then_some(1),
+                    );
+                    self.queue(Action::Play(request));
+                } else {
+                    self.episode_index = 0;
+                    self.enter(Screen::LiveEpisodes);
+                }
+            }
+            Screen::LiveEpisodes => {
+                let Some(anime) = self.live_detail() else {
+                    return;
+                };
+                let request = self.playback.request(
+                    Origin::Live(anime.mal_id),
+                    anime.display_title().to_string(),
+                    Some(self.episode_index as u32 + 1),
+                );
+                self.queue(Action::Play(request));
             }
             _ => {}
         }
+    }
+
+    /// The API reports how many episodes a title has rather than listing them,
+    /// so the picker counts them out. An unknown count means one playable part.
+    pub(crate) fn live_episode_count(&self) -> usize {
+        self.live_detail()
+            .map_or(0, |anime| anime.episodes.unwrap_or(1).max(1) as usize)
     }
 
     pub(crate) fn cached_detail(&self) -> Option<&crate::catalog::Anime> {

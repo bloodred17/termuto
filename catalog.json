@@ -14,12 +14,14 @@
         {
           "number": 1,
           "title": "Episode 1",
-          "released_at": "2026-07-20T18:30:00Z"
+          "released_at": "2026-07-20T18:30:00Z",
+          "source": "media/solo-leveling-season-2/01.mkv"
         },
         {
           "number": 2,
           "title": "Episode 2",
-          "released_at": "2026-07-27T18:30:00Z"
+          "released_at": "2026-07-27T18:30:00Z",
+          "source": "media/solo-leveling-season-2/02.mkv"
         }
       ]
     },
@@ -49,6 +51,7 @@
       "status": "completed",
       "latest_release_at": "2026-07-15T00:00:00Z",
       "description": "Sample movie used by the proof of concept.",
+      "source": "media/look-back.mkv",
       "episodes": []
     }
   }
