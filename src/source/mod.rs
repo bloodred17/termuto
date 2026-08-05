@@ -224,14 +224,20 @@ fn summaries_from_cached(anime: Vec<crate::catalog::Anime>) -> Vec<AnimeSummary>
 
 /// Drops repeats introduced by merging two sources, applies the limit, and only
 /// surfaces an API failure when it left nothing to show.
-fn finish(rows: Vec<AnimeSummary>, failure: Option<Error>, limit: usize) -> Result<Vec<AnimeSummary>> {
+fn finish(
+    rows: Vec<AnimeSummary>,
+    failure: Option<Error>,
+    limit: usize,
+) -> Result<Vec<AnimeSummary>> {
     let mut seen = HashSet::new();
     let mut deduped: Vec<AnimeSummary> = rows
         .into_iter()
         .filter(|row| seen.insert(row.dedupe_key()))
         .collect();
 
-    if deduped.is_empty() && let Some(error) = failure {
+    if deduped.is_empty()
+        && let Some(error) = failure
+    {
         return Err(error);
     }
 
@@ -281,10 +287,17 @@ mod tests {
 
     #[test]
     fn merged_rows_drop_repeats_and_respect_the_limit() {
-        let rows = vec![summary(1, "Frieren"), summary(2, "frieren"), summary(3, "Bebop")];
+        let rows = vec![
+            summary(1, "Frieren"),
+            summary(2, "frieren"),
+            summary(3, "Bebop"),
+        ];
         let merged = finish(rows, None, 10).expect("merge succeeds");
         assert_eq!(merged.len(), 2);
-        assert_eq!(finish(vec![summary(1, "A")], None, 0).expect("limit").len(), 0);
+        assert_eq!(
+            finish(vec![summary(1, "A")], None, 0).expect("limit").len(),
+            0
+        );
     }
 
     #[test]

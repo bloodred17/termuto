@@ -123,9 +123,7 @@ fn playing_a_catalog_episode_uses_the_source_the_catalog_points_at() {
         .args(["play", "solo", "--episode", "2"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Solo Leveling Season 2 episode 2",
-        ))
+        .stdout(predicate::str::contains("Solo Leveling Season 2 episode 2"))
         .stdout(predicate::str::contains("via catalog"))
         .stdout(predicate::str::contains(
             "media/solo-leveling-season-2/02.mkv",
@@ -213,7 +211,9 @@ fn turning_autoswitch_off_holds_the_other_hosts_back_and_says_so() {
         .args(["--autoswitch", "off", "play", "frieren"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Providers tried: catalog, zokoanime"))
+        .stderr(predicate::str::contains(
+            "Providers tried: catalog, zokoanime",
+        ))
         .stderr(predicate::str::contains(
             "Autoswitch is off, so megavid was not tried",
         ));

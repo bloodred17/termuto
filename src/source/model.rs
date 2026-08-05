@@ -55,7 +55,10 @@ impl AnimeSummary {
         Self {
             origin: Origin::Live(anime.mal_id),
             title: anime.display_title().to_string(),
-            kind: anime.media_type.clone().unwrap_or_else(|| EMPTY.to_string()),
+            kind: anime
+                .media_type
+                .clone()
+                .unwrap_or_else(|| EMPTY.to_string()),
             status: short_status(anime.status.as_deref()),
             score: anime.score,
             episodes: anime.episodes,

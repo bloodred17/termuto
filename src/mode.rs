@@ -68,11 +68,9 @@ pub fn resolve_mode(option: Option<Mode>) -> Result<Mode, String> {
         return Ok(mode);
     }
     match env::var(MODE_ENV) {
-        Ok(value) if !value.trim().is_empty() => {
-            value.parse().map_err(|error: String| {
-                format!("{MODE_ENV} is invalid: {error}")
-            })
-        }
+        Ok(value) if !value.trim().is_empty() => value
+            .parse()
+            .map_err(|error: String| format!("{MODE_ENV} is invalid: {error}")),
         _ => Ok(Mode::default()),
     }
 }
