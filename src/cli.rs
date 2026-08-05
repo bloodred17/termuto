@@ -1,6 +1,6 @@
 use crate::catalog::AnimeKind;
 use crate::mode::{MODE_ENV, Mode, resolve_mode};
-use crate::playback::{Audio, Playback, Quality, resolve_player, resolve_prefs};
+use crate::playback::{Audio, PROVIDER_ENV, Playback, Quality, resolve_player, resolve_prefs};
 use crate::source::{AnimeDetail, AnimeSummary, SeasonRef, Source};
 use crate::tui;
 use anyhow::{Result, anyhow, bail};
@@ -34,6 +34,11 @@ pub struct Cli {
     /// Player to hand streams to (defaults to TERMUTO_PLAYER or mpv)
     #[arg(long, global = true, value_name = "PLAYER")]
     pub player: Option<String>,
+
+    /// Host to resolve streams from first, e.g. megavid (defaults to
+    /// TERMUTO_PROVIDER or zokoanime). The others stay on as fallbacks.
+    #[arg(long, global = true, value_name = "PROVIDER")]
+    pub provider: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -100,7 +105,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(issue) = source.catalog_issue() {
         eprintln!("warning: continuing without the local catalog — {issue}");
     }
-    let playback = Playback::for_source(&source, prefs, resolve_player(cli.player))?;
+    let mut playback = Playback::for_source(&source, prefs, resolve_player(cli.player))?;
+    if let Some(provider) = resolve_provider(cli.provider) {
+        playback.prefer_provider(&provider)?;
+    }
 
     match cli.command {
         None | Some(Command::Tui) => tui::run(source, playback).await,
@@ -221,7 +229,27 @@ async fn play(
     println!("{}", stream.url);
     // The player is detached, so anything it rejects fails after this returns.
     println!("Player output: {}", playback.log_path().display());
+
+    // This host's segments are repaired by a proxy running in this process, so
+    // returning now would cut the stream off. Every other stream still returns
+    // the moment the player is up.
+    if let Some(port) = playback.proxy_port() {
+        println!(
+            "Proxying segments on 127.0.0.1:{port} — this command stays open until the \
+             player exits."
+        );
+        playback.wait_for_players().await;
+    }
     Ok(())
+}
+
+/// Resolution order: `--provider`, then `TERMUTO_PROVIDER`, then the chain's own
+/// leading host. An empty value is no choice rather than an error.
+fn resolve_provider(option: Option<String>) -> Option<String> {
+    option
+        .or_else(|| env::var(PROVIDER_ENV).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 pub fn resolve_catalog_path(option: Option<PathBuf>) -> PathBuf {

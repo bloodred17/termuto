@@ -7,6 +7,7 @@
 //! is a single self-contained implementation of [`StreamProvider`] — replacing a
 //! dead extractor is a one-file change and never touches the frontends.
 
+use super::megavid::MegavidProvider;
 use super::prefs::{Audio, Quality, TrackPrefs};
 use super::zoko::ZokoProvider;
 use crate::catalog::{AnimeKind, CatalogRepository};
@@ -14,6 +15,9 @@ use crate::source::Origin;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use std::fmt;
+
+/// Names the host consulted first when `--provider` is absent.
+pub const PROVIDER_ENV: &str = "TERMUTO_PROVIDER";
 
 /// What playback was asked for, before any provider has looked at it.
 #[derive(Clone, Debug)]
@@ -52,6 +56,10 @@ pub struct Stream {
     pub audio: Audio,
     /// What the provider actually served, which need not be what was asked for.
     pub quality: Option<String>,
+    /// Set when the host disguises its segments and no player can read them
+    /// directly. Playback routes such a stream through [`super::proxy`] rather
+    /// than handing [`Self::url`] to the player.
+    pub strip_segment_prefix: bool,
 }
 
 impl fmt::Display for Stream {
@@ -71,27 +79,106 @@ pub trait StreamProvider: Send + Sync + fmt::Debug {
     /// `Ok(None)` means "not a request I serve" and hands over to the next
     /// provider. `Err` means this provider owned the request and failed.
     async fn resolve(&self, request: &StreamRequest) -> Result<Option<Stream>>;
+
+    /// Whether this is a remote host the user can choose between. The catalog
+    /// is not one: it serves only its own rows and declines everything else, so
+    /// preferring it would change nothing.
+    fn is_remote(&self) -> bool {
+        true
+    }
 }
 
 /// The ordered list of providers consulted for one request.
 #[derive(Debug)]
 pub struct ProviderChain {
     providers: Vec<Box<dyn StreamProvider>>,
+    /// Which remote host to ask first. The rest still follow as fallbacks, so
+    /// choosing one changes which host answers when several could, without
+    /// costing the coverage of the others.
+    preferred: Option<String>,
 }
 
 impl ProviderChain {
     pub fn new(providers: Vec<Box<dyn StreamProvider>>) -> Self {
-        Self { providers }
+        Self {
+            providers,
+            preferred: None,
+        }
     }
 
-    /// The catalog answers for its own rows; ZokoAnime answers for the API rows,
-    /// which carry the MyAnimeList id it is addressed by. Adding another
-    /// extractor means inserting it here.
+    /// The catalog answers for its own rows; the extractors answer for the API
+    /// rows, which carry the MyAnimeList id both are addressed by. ZokoAnime
+    /// leads because it plays without a proxy; MegaVid follows because it
+    /// carries titles ZokoAnime does not. Adding another means inserting it here.
     pub fn with_catalog(catalog: Option<CatalogRepository>) -> Result<Self> {
         Ok(Self::new(vec![
             Box::new(CatalogProvider { catalog }),
             Box::new(ZokoProvider::new()?),
+            Box::new(MegavidProvider::new()?),
         ]))
+    }
+
+    /// The hosts the user can choose between, in declared order.
+    pub fn remote_names(&self) -> Vec<&str> {
+        self.providers
+            .iter()
+            .filter(|provider| provider.is_remote())
+            .map(|provider| provider.name())
+            .collect()
+    }
+
+    /// The host asked first, which is the leading remote one unless a choice
+    /// has been made.
+    pub fn preferred(&self) -> Option<&str> {
+        self.preferred
+            .as_deref()
+            .or_else(|| self.remote_names().first().copied())
+    }
+
+    /// Moves the preference to the next host, wrapping at the end.
+    pub fn cycle_preferred(&mut self) {
+        let names = self.remote_names();
+        let Some(current) = self.preferred() else {
+            return;
+        };
+        let next = names
+            .iter()
+            .position(|name| *name == current)
+            .map(|index| (index + 1) % names.len())
+            .unwrap_or_default();
+        self.preferred = names.get(next).map(|name| name.to_string());
+    }
+
+    /// Chooses `name` as the leading host. Fails rather than silently ignoring
+    /// an unknown name, which would otherwise look like the choice took effect.
+    pub fn prefer(&mut self, name: &str) -> Result<()> {
+        let names = self.remote_names();
+        match names.iter().find(|known| **known == name) {
+            Some(known) => {
+                self.preferred = Some((*known).to_string());
+                Ok(())
+            }
+            None => bail!(
+                "Unknown provider \"{name}\". Available providers: {}.",
+                names.join(", ")
+            ),
+        }
+    }
+
+    /// The order this chain is actually consulted in: the preferred host first,
+    /// then everything else as declared.
+    fn order(&self) -> Vec<&dyn StreamProvider> {
+        let preferred = self.preferred();
+        let leads = |provider: &&dyn StreamProvider| {
+            provider.is_remote() && Some(provider.name()) == preferred
+        };
+        let all = self.providers.iter().map(Box::as_ref);
+        let (front, rest): (Vec<_>, Vec<_>) = all.partition(leads);
+        // The catalog stays ahead of every host: it plays a local file, which
+        // beats a scrape whenever it has one.
+        let (local, remote): (Vec<_>, Vec<_>) =
+            rest.into_iter().partition(|provider| !provider.is_remote());
+        local.into_iter().chain(front).chain(remote).collect()
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -106,7 +193,7 @@ impl ProviderChain {
     /// so one dead extractor cannot block a working one behind it.
     pub async fn resolve(&self, request: &StreamRequest) -> Result<Stream> {
         let mut failures = Vec::new();
-        for provider in &self.providers {
+        for provider in self.order() {
             match provider.resolve(request).await {
                 Ok(Some(stream)) => return Ok(stream),
                 Ok(None) => {}
@@ -140,6 +227,11 @@ struct CatalogProvider {
 impl StreamProvider for CatalogProvider {
     fn name(&self) -> &str {
         "catalog"
+    }
+
+    /// Not a choice: it serves its own rows and declines everything else.
+    fn is_remote(&self) -> bool {
+        false
     }
 
     async fn resolve(&self, request: &StreamRequest) -> Result<Option<Stream>> {
@@ -182,6 +274,7 @@ impl StreamProvider for CatalogProvider {
                 Quality::Best => None,
                 Quality::Exact(height) => Some(height.clone()),
             },
+            strip_segment_prefix: false,
         }))
     }
 }
@@ -232,9 +325,46 @@ mod tests {
     /// The default chain is asserted here rather than exercised: resolving an
     /// API row means a request to the live host, which a unit test must not make.
     #[test]
-    fn the_catalog_is_tried_before_the_remote_extractor() {
+    fn the_catalog_leads_and_zokoanime_is_the_default_host() {
         let chain = ProviderChain::with_catalog(None).expect("the chain builds");
-        assert_eq!(chain.names(), vec!["catalog", "zokoanime"]);
+        assert_eq!(chain.names(), vec!["catalog", "zokoanime", "megavid"]);
+        assert_eq!(chain.remote_names(), vec!["zokoanime", "megavid"]);
+        // ZokoAnime leads because it plays without a proxy.
+        assert_eq!(chain.preferred(), Some("zokoanime"));
+    }
+
+    /// `p` in the TUI, and `--provider` on the CLI, only change which host is
+    /// asked first — the catalog still leads, and the other host still follows
+    /// as a fallback, so choosing one never costs the coverage of the other.
+    #[test]
+    fn choosing_a_host_reorders_only_the_hosts() {
+        let mut chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        chain.prefer("megavid").expect("a known host");
+        assert_eq!(chain.preferred(), Some("megavid"));
+
+        let order: Vec<&str> = chain.order().iter().map(|p| p.name()).collect();
+        assert_eq!(order, vec!["catalog", "megavid", "zokoanime"]);
+    }
+
+    #[test]
+    fn cycling_walks_the_hosts_and_wraps() {
+        let mut chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        chain.cycle_preferred();
+        assert_eq!(chain.preferred(), Some("megavid"));
+        chain.cycle_preferred();
+        assert_eq!(chain.preferred(), Some("zokoanime"));
+    }
+
+    /// Silently ignoring an unknown name would look like the choice took effect.
+    #[test]
+    fn an_unknown_host_is_rejected_and_names_the_known_ones() {
+        let mut chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        let error = chain.prefer("nyaa").expect_err("not a host");
+        let message = format!("{error:#}");
+        assert!(message.contains("nyaa"), "{message}");
+        assert!(message.contains("zokoanime, megavid"), "{message}");
+        // The rejected choice leaves the previous one standing.
+        assert_eq!(chain.preferred(), Some("zokoanime"));
     }
 
     #[tokio::test]
@@ -267,6 +397,7 @@ mod tests {
                 subtitles: Vec::new(),
                 audio: request.prefs.audio,
                 quality: None,
+                strip_segment_prefix: false,
             }))
         }
     }

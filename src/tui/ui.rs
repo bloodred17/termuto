@@ -24,9 +24,10 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(
         Paragraph::new(format!(
-            "termuto — anime from the terminal · mode: {} · player: {}",
+            "termuto — anime from the terminal · mode: {} · player: {} · provider: {}",
             app.mode(),
-            app.player_name()
+            app.player_name(),
+            app.provider_name()
         ))
         .block(Block::default().borders(Borders::ALL).title(" termuto "))
         .alignment(Alignment::Center),
@@ -541,17 +542,17 @@ fn help_text(app: &App) -> &'static str {
         return "Loading…";
     }
     match app.screen {
-        Screen::Home => "↑/↓ select • Enter open • / Search • q Quit",
+        Screen::Home => "↑/↓ select • Enter open • / Search • p Provider • q Quit",
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
-        Screen::SeasonPicker => "↑/↓ or j/k select • Enter open season • Esc back • q Quit",
-        Screen::LiveDetail => "↑/↓ or j/k scroll • PgUp/PgDn page • Enter play • Esc back",
+        Screen::SeasonPicker => "↑/↓ or j/k select • Enter open season • p Provider • Esc back",
+        Screen::LiveDetail => "↑/↓ or j/k scroll • Enter play • p Provider • Esc back",
         Screen::Episodes | Screen::LiveEpisodes | Screen::MovieDetail => {
-            "↑/↓ or j/k select • Enter play • Esc back"
+            "↑/↓ or j/k select • Enter play • p Provider • Esc back"
         }
         Screen::Playing => "Any key to dismiss",
         Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         Screen::Error => "Any key to dismiss",
-        Screen::Listing => "↑/↓ or j/k select • Enter open • / Search • Esc back • q Quit",
+        Screen::Listing => "↑/↓ or j/k select • Enter open • / Search • p Provider • Esc back",
     }
 }
 

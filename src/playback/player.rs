@@ -112,6 +112,13 @@ impl Player {
         self.running
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
     }
+
+    /// Whether any player started here is still going. Reaps first, so this
+    /// answers about live players rather than unclaimed exit statuses.
+    pub fn any_running(&mut self) -> bool {
+        self.reap();
+        !self.running.is_empty()
+    }
 }
 
 /// Built separately from the spawn so the command line can be asserted on
@@ -166,6 +173,7 @@ mod tests {
             subtitles: vec!["https://example.test/en.vtt".into()],
             audio: Audio::Sub,
             quality: Some("1080".into()),
+            strip_segment_prefix: false,
         }
     }
 

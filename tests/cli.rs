@@ -16,6 +16,7 @@ fn command() -> Command {
         .env_remove("TERMUTO_CATALOG")
         .env_remove("TERMUTO_PLAYER")
         .env_remove("TERMUTO_AUDIO")
+        .env_remove("TERMUTO_PROVIDER")
         .env_remove("TERMUTO_QUALITY");
     command
 }
@@ -169,6 +170,38 @@ fn a_missing_player_names_itself_and_how_to_change_it() {
         .failure()
         .stderr(predicate::str::contains("definitely-not-a-player"))
         .stderr(predicate::str::contains("TERMUTO_PLAYER"));
+}
+
+/// Silently ignoring an unknown host would look like the choice took effect,
+/// and the stream would quietly come from the wrong place.
+#[test]
+fn an_unknown_provider_is_rejected_and_names_the_known_ones() {
+    cached()
+        .args(["--provider", "nyaa", "play", "solo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nyaa"))
+        .stderr(predicate::str::contains("zokoanime, megavid"));
+
+    command()
+        .env("TERMUTO_PROVIDER", "nyaa")
+        .args(["--mode", "cached", "latest"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nyaa"));
+}
+
+/// Choosing a host must not disturb the catalog, which still leads the chain.
+#[test]
+fn choosing_a_host_leaves_catalog_rows_playing_from_the_catalog() {
+    playable()
+        .args(["--provider", "megavid", "play", "solo", "--episode", "2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("via catalog"))
+        .stdout(predicate::str::contains(
+            "media/solo-leveling-season-2/02.mkv",
+        ));
 }
 
 #[test]

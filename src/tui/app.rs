@@ -147,6 +147,12 @@ impl App {
         self.playback.player_name()
     }
 
+    /// The host `p` currently has selected, shown in the header so the choice
+    /// is visible rather than something to remember.
+    pub(crate) fn provider_name(&self) -> &str {
+        self.playback.provider().unwrap_or("none")
+    }
+
     /// The screen whose contents are on show. The quit prompt, the now-playing
     /// panel, and errors are overlays, so the screen underneath keeps drawing.
     pub(crate) fn display_screen(&self) -> Screen {
@@ -361,6 +367,9 @@ impl App {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => self.go_back(),
             KeyCode::Char('/') => self.enter_search(),
+            // Takes effect on the next play; nothing already handed to the
+            // player is affected.
+            KeyCode::Char('p') => self.playback.cycle_provider(),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
@@ -596,7 +605,52 @@ fn move_index(index: &mut usize, count: usize, direction: isize) {
 
 #[cfg(test)]
 mod tests {
-    use super::move_index;
+    use super::{App, move_index};
+    use crate::mode::Mode;
+    use crate::playback::{Playback, TrackPrefs};
+    use crate::source::Source;
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    /// Built from the repo's own catalog in cached mode, so nothing here needs
+    /// the network.
+    async fn app() -> App {
+        let source = Source::open(Mode::Cached, "catalog.json")
+            .await
+            .expect("the catalog opens");
+        let playback = Playback::new(
+            source.catalog().cloned(),
+            TrackPrefs::default(),
+            "true".to_string(),
+        )
+        .expect("playback builds");
+        App::new(source, playback)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code));
+    }
+
+    #[tokio::test]
+    async fn p_cycles_the_host_streams_are_resolved_from() {
+        let mut app = app().await;
+        assert_eq!(app.provider_name(), "zokoanime");
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.provider_name(), "megavid");
+        // And wraps, so the key alone gets back to where it started.
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.provider_name(), "zokoanime");
+    }
+
+    /// `p` is an ordinary letter, so it has to reach the query rather than
+    /// silently switching hosts while a search is being typed.
+    #[tokio::test]
+    async fn p_types_into_a_search_instead_of_switching() {
+        let mut app = app().await;
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.search_input, "p");
+        assert_eq!(app.provider_name(), "zokoanime");
+    }
 
     #[test]
     fn selection_stays_in_bounds() {
