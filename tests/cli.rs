@@ -182,9 +182,13 @@ fn an_unknown_provider_is_rejected_and_names_the_known_ones() {
         .stderr(predicate::str::contains("nyaa"))
         .stderr(predicate::str::contains("zokoanime, megavid"));
 
-    command()
+    // Pinned to the fixture catalog like every other case here: without it this
+    // falls back to ~/.termuto/catalog.json, so the run fails on the missing
+    // catalog before the provider is ever validated, and the assertion only
+    // passes on a machine that happens to have a catalog installed.
+    cached()
         .env("TERMUTO_PROVIDER", "nyaa")
-        .args(["--mode", "cached", "latest"])
+        .arg("latest")
         .assert()
         .failure()
         .stderr(predicate::str::contains("nyaa"));
