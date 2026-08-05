@@ -1,6 +1,6 @@
 [package]
 name = "termuto"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Let-chains in `source::finish` need 1.88; `is_multiple_of` in the TUI needs 1.87.
 rust-version = "1.88"

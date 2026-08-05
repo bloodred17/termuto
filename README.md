@@ -117,7 +117,7 @@ TERMUTO_CATALOG=/data/anime.json termuto --mode cached ongoing
 cargo run -- tui        # or just `cargo run --`
 ```
 
-The home menu follows the mode. With the API in play it offers **Top anime**, **This season**, **Browse seasons**, **Recommendations**, **Airing now**, **Search**, and **Quit**; in `cached` mode it offers **Latest releases**, **Airing now**, **Search**, and **Quit**.
+The home menu follows the mode. With the API in play it offers **Top anime**, **This season**, **Browse seasons**, **Recommendations**, and **Airing now**; in `cached` mode it offers **Latest releases** and **Airing now**. Every mode then offers **Favourites**, **Previously watched**, **Search**, and **Quit** — those two lists are the user's own, so they are never hidden.
 
 | Keys | Action |
 | --- | --- |
@@ -126,6 +126,8 @@ The home menu follows the mode. With the API in play it offers **Top anime**, **
 | `PgUp` / `PgDn` | Page through a list, or scroll a detail |
 | `Enter` | Select, open, or play |
 | `/` | Start a search |
+| `b` | Star or unstar the title (adds it to **Favourites**) |
+| `Alt-d` | Clear or restore the watched check on an episode |
 | `n` | Sort the list by name; again for Z–A |
 | `d` | Sort the list by date; again for oldest first |
 | `f` | Filter the list by name, as you type |
@@ -144,6 +146,18 @@ Opening a row loads its details: `/anime/{id}/full` for an API row, and the epis
 Every list — titles, search results, episodes, and the season index — can be reordered and narrowed without another request. `n` and `d` sort by name and by date, and pressing the same key again reverses it; rows the source has no date for stay at the bottom either way. `f` starts a filter that matches anywhere in a row's name and narrows the list on each keystroke: `Enter` keeps it and hands the keys back to the list, `Esc` abandons it. `t` steps through the types a listing holds — `TV`, `Movie`, `OVA`, and whatever else is in its **TYPE** column — and past the last one back to all of them; the types on offer are only the ones the name filter has left, so `t` never lands on an empty screen, and the two filters narrow together. A list with no type column, such as an episode picker, has nothing to step through and `t` does nothing there. How a list is ordered and how much the filter is holding back are shown under its bottom border, and a sort or a filter moves the rows under the highlight rather than moving the highlight, so `Enter` still opens what it was pointing at. Loading a new list starts it over in the order its source chose. Lists keep their own settings, so filtering a listing and stepping into a title does not filter its episodes too.
 
 `Enter` on a title plays it. A catalog series and a live series both open an episode list first; a movie plays straight away. Once the player has the stream, a **Now playing** overlay reports which provider answered and what was handed over, and any key dismisses it.
+
+### Favourites and watch history
+
+`b` stars whatever title the screen is about — the highlighted row of a listing or search result, or the title a detail screen and its episode picker belong to. A starred title carries a `★` after its name wherever it is drawn, inside the **TITLE** column so the columns after it still line up. **Favourites** on the home menu lists them, newest first, and sorts and filters like any other listing; `b` there unstars, and the row leaves the list.
+
+Playing an episode adds it to **Previously watched**, newest first, and puts a `✓` beside it in the episode picker. Because the player runs detached, "watched" means the stream reached the player — nothing reports back that an episode finished. `Enter` on a history row replays that episode, from the origin it was played from rather than whatever the current mode reads. Re-playing an episode moves it up the list instead of listing it twice, and the history is capped at 500 rows.
+
+`Alt-d` (`Option-d`) clears the check on the highlighted episode without losing the play: the entry keeps its place in the history with `marked` set to `false`, and pressing it again puts the check back. It works in both episode pickers and on the history screen itself, where `t` also steps between the plays still checked and the ones cleared. On macOS terminals that do not send `Option` as a modifier, the `∂` they send instead is read the same way.
+
+Both lists live in `~/.termuto/library.json`, overridden by `--library` or `TERMUTO_LIBRARY`. Each change writes the whole file through a temporary file and a rename, so an interrupted save leaves the previous library rather than half of a new one. A file that does not parse is reported at startup, comes up as empty lists, and is never written over.
+
+Neither list is keyed by origin: the same title is `Origin::Cached` in one mode and `Origin::Live` in another. They match on the folded title instead — the same key hybrid mode already uses to de-duplicate two sources — so a title starred from the API keeps its star when the catalog serves it. The origin is kept only to reopen or replay the row with, and a row whose origin the current mode cannot reach says so rather than failing quietly.
 
 The episode picker for a live series is filled from `/anime/{id}/episodes`: each row carries the episode's title, air date, and score, and beside the list sit two panes for whichever episode is selected — its still, and its synopsis with the runtime in the pane's title. `v` and `s` toggle the panes, both start open, and on a terminal narrower than 76 columns neither is drawn, so the list keeps the whole width.
 
@@ -384,6 +398,8 @@ Pass --catalog <PATH>, set TERMUTO_CATALOG, or place a catalog at ~/.termuto/cat
 ```
 
 In `hybrid` mode the same situation is a warning on stderr, and the session continues against the API alone.
+
+The library — the favourites and the watch history — resolves the same way, through global `--library <PATH>`, then `TERMUTO_LIBRARY`, then `~/.termuto/library.json`. Unlike the catalog it *is* created: a missing file is simply an empty library, written the first time something is starred or played.
 
 ## Catalog schema and Deeb 0.0.13 behavior
 
