@@ -1,4 +1,4 @@
-use super::preview::{self, Preview};
+use super::preview::{self, Preview, Renderer};
 use crate::catalog::AnimeKind;
 use crate::live::LiveEpisode;
 use crate::mode::Mode;
@@ -7,7 +7,6 @@ use crate::source::{AnimeDetail, AnimeSummary, Origin, SeasonRef, Source};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use image::DynamicImage;
-use ratatui_image::picker::Picker;
 use std::collections::HashMap;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -134,8 +133,8 @@ pub(crate) struct App {
     previews: HashMap<String, Preview>,
     preview_tx: UnboundedSender<(String, Option<Box<DynamicImage>>)>,
     preview_rx: UnboundedReceiver<(String, Option<Box<DynamicImage>>)>,
-    /// What the terminal answered when asked how it draws images.
-    picker: Picker,
+    /// How stills get drawn, as worked out from the terminal.
+    renderer: Renderer,
     pub(crate) error: Option<String>,
     /// What the last successful play handed to the player, shown on
     /// [`Screen::Playing`].
@@ -145,7 +144,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(source: Source, playback: Playback, picker: Picker) -> Self {
+    pub(crate) fn new(source: Source, playback: Playback, renderer: Renderer) -> Self {
         let (preview_tx, preview_rx) = unbounded_channel();
         Self {
             source,
@@ -170,7 +169,7 @@ impl App {
             previews: HashMap::new(),
             preview_tx,
             preview_rx,
-            picker,
+            renderer,
             error: None,
             now_playing: None,
             pending: None,
@@ -674,8 +673,8 @@ impl App {
 
     /// How stills are being drawn, named in the preview pane so a fallback to
     /// half-blocks is visible rather than just looking bad.
-    pub(crate) fn preview_protocol(&self) -> &'static str {
-        preview::protocol_name(self.picker.protocol_type())
+    pub(crate) fn preview_protocol(&self) -> String {
+        self.renderer.label()
     }
 
     /// The still for the selected episode, once it has arrived.
@@ -743,7 +742,7 @@ impl App {
     pub(crate) fn collect_previews(&mut self) {
         while let Ok((url, decoded)) = self.preview_rx.try_recv() {
             let entry = match decoded {
-                Some(image) => Preview::Ready(Box::new(self.picker.new_resize_protocol(*image))),
+                Some(image) => Preview::Ready(Box::new(self.renderer.new_protocol(*image))),
                 None => Preview::Missing,
             };
             self.previews.insert(url, entry);
@@ -783,12 +782,11 @@ fn move_index(index: &mut usize, count: usize, direction: isize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, move_index};
+    use super::{App, Renderer, move_index};
     use crate::mode::Mode;
     use crate::playback::{Playback, TrackPrefs};
     use crate::source::Source;
     use crossterm::event::{KeyCode, KeyEvent};
-    use ratatui_image::picker::Picker;
 
     /// Built from the repo's own catalog in cached mode, so nothing here needs
     /// the network.
@@ -803,7 +801,7 @@ mod tests {
         )
         .expect("playback builds");
         // Nothing here queries a terminal, so the fallback renderer stands in.
-        App::new(source, playback, Picker::halfblocks())
+        App::new(source, playback, Renderer::halfblocks())
     }
 
     fn press(app: &mut App, code: KeyCode) {

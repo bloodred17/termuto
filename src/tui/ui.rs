@@ -891,6 +891,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use super::super::preview::Renderer;
     use super::{App, Color, Screen, header_line, render, thousands, truncate_to, wrap_text};
     use crate::live::{LiveAnime, LiveEpisode};
     use crate::mode::Mode;
@@ -898,7 +899,6 @@ mod tests {
     use crate::source::{AnimeDetail, Source};
     use crossterm::event::{KeyCode, KeyEvent};
     use ratatui::{Terminal, backend::TestBackend};
-    use ratatui_image::picker::Picker;
 
     async fn app() -> App {
         let source = Source::open(Mode::Cached, "catalog.json")
@@ -911,7 +911,7 @@ mod tests {
         )
         .expect("playback builds");
         // Nothing here queries a terminal, so the fallback renderer stands in.
-        App::new(source, playback, Picker::halfblocks())
+        App::new(source, playback, Renderer::halfblocks())
     }
 
     fn header(app: &App) -> String {
