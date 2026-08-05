@@ -126,6 +126,10 @@ The home menu follows the mode. With the API in play it offers **Top anime**, **
 | `PgUp` / `PgDn` | Page through a list, or scroll a detail |
 | `Enter` | Select, open, or play |
 | `/` | Start a search |
+| `n` | Sort the list by name; again for Z–A |
+| `d` | Sort the list by date; again for oldest first |
+| `f` | Filter the list by name, as you type |
+| `t` | Step through the types the list holds, and back to all of them |
 | `p` | Switch which host streams resolve from |
 | `a` | Toggle autoswitch (shown as `auto` in the header) |
 | `v` | Show or hide the episode still (episode picker, on by default) |
@@ -136,6 +140,8 @@ The home menu follows the mode. With the API in play it offers **Top anime**, **
 | `y` / `n` | Answer the quit prompt |
 
 Opening a row loads its details: `/anime/{id}/full` for an API row, and the episode list or movie screen for a catalog row. Live searches run on `Enter` rather than on each keystroke, so typing does not fire a request per character; `↓` moves from the query into the results and `Esc` moves back.
+
+Every list — titles, search results, episodes, and the season index — can be reordered and narrowed without another request. `n` and `d` sort by name and by date, and pressing the same key again reverses it; rows the source has no date for stay at the bottom either way. `f` starts a filter that matches anywhere in a row's name and narrows the list on each keystroke: `Enter` keeps it and hands the keys back to the list, `Esc` abandons it. `t` steps through the types a listing holds — `TV`, `Movie`, `OVA`, and whatever else is in its **TYPE** column — and past the last one back to all of them; the types on offer are only the ones the name filter has left, so `t` never lands on an empty screen, and the two filters narrow together. A list with no type column, such as an episode picker, has nothing to step through and `t` does nothing there. How a list is ordered and how much the filter is holding back are shown under its bottom border, and a sort or a filter moves the rows under the highlight rather than moving the highlight, so `Enter` still opens what it was pointing at. Loading a new list starts it over in the order its source chose. Lists keep their own settings, so filtering a listing and stepping into a title does not filter its episodes too.
 
 `Enter` on a title plays it. A catalog series and a live series both open an episode list first; a movie plays straight away. Once the player has the stream, a **Now playing** overlay reports which provider answered and what was handed over, and any key dismisses it.
 
