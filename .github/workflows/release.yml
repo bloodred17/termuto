@@ -49,8 +49,12 @@ jobs:
             runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
+          # Cross-compiled from the arm64 runner rather than built natively on
+          # macos-13, whose pool is being retired and left the job queued
+          # indefinitely. The Xcode SDK carries both slices, so this only needs
+          # the extra rustc target.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
