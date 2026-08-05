@@ -1,13 +1,26 @@
 [package]
-name = "termuto-poc"
+name = "termuto"
 version = "0.1.0"
 edition = "2024"
-description = "A small terminal anime catalog proof of concept"
+# Let-chains in `source::finish` need 1.88; `is_multiple_of` in the TUI needs 1.87.
+rust-version = "1.88"
+description = "Browse and play anime from the terminal, live from the Tenrai API or a local catalog"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/bloodred17/termuto"
+homepage = "https://github.com/bloodred17/termuto"
+keywords = ["anime", "tui", "cli", "ratatui", "terminal"]
+categories = ["command-line-utilities"]
+exclude = ["/.github", "/tests", "/target"]
 
 [[bin]]
 name = "termuto"
 path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [dependencies]
 anyhow = "1"

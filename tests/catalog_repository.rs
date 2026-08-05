@@ -1,6 +1,6 @@
-use termuto_poc::catalog::CatalogRepository;
 use std::{fs, path::PathBuf};
 use tempfile::TempDir;
+use termuto::catalog::CatalogRepository;
 
 fn catalog_file(contents: &str) -> (TempDir, PathBuf) {
     let directory = tempfile::tempdir().expect("temporary directory");

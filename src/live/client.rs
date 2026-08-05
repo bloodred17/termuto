@@ -39,7 +39,11 @@ impl LiveClient {
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("termuto-poc/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()
             .context("Could not build the HTTP client for the Tenrai API")?;
         Ok(Self {
@@ -180,7 +184,10 @@ impl LiveClient {
             .with_context(|| format!("Could not read the Tenrai API response from {url}"))?;
 
         if !status.is_success() {
-            bail!("Tenrai API request failed ({status}): {}", api_message(&body));
+            bail!(
+                "Tenrai API request failed ({status}): {}",
+                api_message(&body)
+            );
         }
 
         serde_json::from_str(&body)

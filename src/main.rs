@@ -1,5 +1,5 @@
-use termuto_poc::cli::{self, Cli};
 use clap::Parser;
+use termuto::cli::{self, Cli};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
