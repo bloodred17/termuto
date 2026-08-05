@@ -1,6 +1,7 @@
 use super::preview::{self, Preview, Renderer};
 use super::view::{ListView, RowKeys, SortKey};
 use crate::catalog::AnimeKind;
+use crate::library::{Library, Watch};
 use crate::live::LiveEpisode;
 use crate::mode::Mode;
 use crate::playback::{Playback, StreamRequest};
@@ -43,6 +44,8 @@ pub(crate) enum Screen {
     LiveEpisodes,
     /// A catalog movie.
     MovieDetail,
+    /// The episodes the user has played, newest first.
+    Watched,
     /// Raised once the player has been handed a resolved stream.
     Playing,
     QuitConfirm,
@@ -104,12 +107,19 @@ enum HomeChoice {
     /// Needs the network, so it goes through the pending-action path.
     Load(Action),
     Search,
+    /// Both of the user's own lists are already in memory, so they open without
+    /// a request and without a loading frame.
+    Favourites,
+    Watched,
     Quit,
 }
 
 pub(crate) struct App {
     source: Source,
     playback: Playback,
+    /// The user's own two lists. Held by value: every change is one key press
+    /// and writes straight through, so there is no other copy to reconcile.
+    library: Library,
     pub(crate) screen: Screen,
     /// Screens to return to, innermost last.
     history: Vec<Screen>,
@@ -117,8 +127,12 @@ pub(crate) struct App {
     pub(crate) list_index: usize,
     pub(crate) episode_index: usize,
     pub(crate) season_index: usize,
+    pub(crate) watch_index: usize,
     pub(crate) listing_title: String,
     pub(crate) listing: Vec<AnimeSummary>,
+    /// Whether the listing on screen is the favourites, which is the one list
+    /// that has to be rebuilt when a row is unstarred underneath it.
+    favourites_listing: bool,
     pub(crate) seasons: Vec<SeasonRef>,
     /// How each list is sorted and filtered. One per kind of list rather than
     /// one per screen: the listing and its search results are the same rows,
@@ -126,6 +140,7 @@ pub(crate) struct App {
     pub(crate) listing_view: ListView,
     pub(crate) episodes_view: ListView,
     pub(crate) seasons_view: ListView,
+    pub(crate) watched_view: ListView,
     pub(crate) search_input: String,
     pub(crate) search_focus: SearchFocus,
     pub(crate) search_submitted: Option<String>,
@@ -152,23 +167,32 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(source: Source, playback: Playback, renderer: Renderer) -> Self {
+    pub(crate) fn new(
+        source: Source,
+        playback: Playback,
+        library: Library,
+        renderer: Renderer,
+    ) -> Self {
         let (preview_tx, preview_rx) = unbounded_channel();
         Self {
             source,
             playback,
+            library,
             screen: Screen::Home,
             history: Vec::new(),
             home_index: 0,
             list_index: 0,
             episode_index: 0,
             season_index: 0,
+            watch_index: 0,
             listing_title: String::new(),
             listing: Vec::new(),
+            favourites_listing: false,
             seasons: Vec::new(),
             listing_view: ListView::default(),
             episodes_view: ListView::default(),
             seasons_view: ListView::default(),
+            watched_view: ListView::default(),
             search_input: String::new(),
             search_focus: SearchFocus::Query,
             search_submitted: None,
@@ -262,6 +286,16 @@ impl App {
         entries.push(HomeEntry {
             label: "Airing now",
             choice: HomeChoice::Load(Action::Ongoing),
+        });
+        // The user's own lists are theirs whatever the mode is reading from, so
+        // unlike the screens above these are never hidden.
+        entries.push(HomeEntry {
+            label: "Favourites",
+            choice: HomeChoice::Favourites,
+        });
+        entries.push(HomeEntry {
+            label: "Previously watched",
+            choice: HomeChoice::Watched,
         });
         entries.push(HomeEntry {
             label: "Search",
@@ -380,6 +414,11 @@ impl App {
             Action::Play(request) => {
                 let label = request.label();
                 let stream = self.playback.play(request.clone()).await?;
+                // Recorded once the player has the stream, which is as much as
+                // can be known: the player is detached, so nothing reports back
+                // that an episode was finished — or even started in earnest.
+                self.library
+                    .record_watch(&request.origin, &request.title, request.episode)?;
                 self.now_playing = Some(vec![
                     label,
                     format!("via {stream}"),
@@ -400,7 +439,23 @@ impl App {
         self.listing = rows;
         self.list_index = 0;
         self.listing_view = ListView::default();
+        self.favourites_listing = false;
         self.enter(Screen::Listing);
+    }
+
+    /// The favourites are an ordinary listing whose rows came off disk instead
+    /// of a request, so they get the sorting, the filtering, and the type cycle
+    /// for nothing.
+    fn open_favourites(&mut self) {
+        let rows = self.library.favourites();
+        self.show_listing("Favourites", rows);
+        self.favourites_listing = true;
+    }
+
+    fn open_watched(&mut self) {
+        self.watch_index = 0;
+        self.watched_view = ListView::default();
+        self.enter(Screen::Watched);
     }
 
     /// Moves to `screen`, remembering the current one for `Esc`.
@@ -440,6 +495,18 @@ impl App {
             _ => {}
         }
 
+        // Alt-D takes the check off an episode already played. It is read here,
+        // ahead of both the filter and plain `d`, which sorts by date. macOS
+        // terminals that do not send Option as a modifier send `∂` instead, so
+        // both spellings are honoured.
+        if matches!(key.code, KeyCode::Char('∂'))
+            || (key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char('d' | 'D')))
+        {
+            self.toggle_watch_mark();
+            return true;
+        }
+
         // A filter being typed owns the keyboard, so `q` and the rest stay
         // ordinary letters until it is accepted or abandoned.
         if self.filtering() {
@@ -470,6 +537,9 @@ impl App {
             KeyCode::Char('s') if self.screen == Screen::LiveEpisodes => {
                 self.show_synopsis = !self.show_synopsis;
             }
+            // Stars whatever title the screen is about, which on a list is the
+            // highlighted row and on a detail screen is the title itself.
+            KeyCode::Char('b') => self.toggle_favourite(),
             // No-ops on a screen without a list, like the toggles above.
             KeyCode::Char('f') => self.begin_filter(),
             KeyCode::Char('t') => self.cycle_kind(),
@@ -533,6 +603,7 @@ impl App {
             (SearchFocus::Results, KeyCode::Char('/')) => {
                 self.search_focus = SearchFocus::Query;
             }
+            (SearchFocus::Results, KeyCode::Char('b')) => self.toggle_favourite(),
             // The query is what the API was asked; these narrow and reorder
             // what came back, without spending another request.
             (SearchFocus::Results, KeyCode::Char('f')) => self.begin_filter(),
@@ -562,6 +633,110 @@ impl App {
         self.listing_view = ListView::default();
         self.search_focus = SearchFocus::Query;
         self.enter(Screen::Search);
+    }
+
+    pub(crate) fn library(&self) -> &Library {
+        &self.library
+    }
+
+    /// Lets a test seed a play without going through a real provider and a real
+    /// player, which is the only way the app itself records one.
+    #[cfg(test)]
+    pub(crate) fn library_mut(&mut self) -> &mut Library {
+        &mut self.library
+    }
+
+    /// The plays behind the watched screen, newest first.
+    pub(crate) fn watched(&self) -> &[Watch] {
+        self.library.watched()
+    }
+
+    /// Stars or unstars the title the screen is about. A failed write is worth
+    /// an overlay: the star is on screen either way, and one that was not saved
+    /// would quietly be gone next time.
+    fn toggle_favourite(&mut self) {
+        let Some(summary) = self.favourite_target() else {
+            return;
+        };
+        if let Err(error) = self.library.toggle_favourite(&summary) {
+            self.raise(error);
+            return;
+        }
+        // The favourites listing is the list being edited, so an unstarred row
+        // has to leave it rather than keep drawing a star it no longer has. The
+        // rows are replaced in place so the sort and the filter survive.
+        if self.favourites_listing {
+            self.listing = self.library.favourites();
+            let count = self.visible_listing().len();
+            self.list_index = self.list_index.min(count.saturating_sub(1));
+        }
+    }
+
+    /// The title `b` acts on. A list gives the highlighted row; a detail screen
+    /// and its episode picker give the title they belong to, so the key works
+    /// from wherever the user decided.
+    fn favourite_target(&self) -> Option<AnimeSummary> {
+        match self.screen {
+            Screen::Listing | Screen::Search => self
+                .selected_row()
+                .and_then(|row| self.listing.get(row))
+                .cloned(),
+            Screen::LiveDetail | Screen::LiveEpisodes => {
+                self.live_detail().map(AnimeSummary::from_live)
+            }
+            Screen::Episodes | Screen::MovieDetail => {
+                self.cached_detail().map(AnimeSummary::from_cached)
+            }
+            _ => None,
+        }
+    }
+
+    /// Flips the check on the highlighted episode. Nothing is invented: an
+    /// episode with no play behind it has no check to flip.
+    fn toggle_watch_mark(&mut self) {
+        let Some((title, episode)) = self.mark_target() else {
+            return;
+        };
+        if let Err(error) = self.library.toggle_mark(&title, episode) {
+            self.raise(error);
+        }
+    }
+
+    /// Which play Alt-D acts on, as the title and episode the two lists key by.
+    fn mark_target(&self) -> Option<(String, Option<u32>)> {
+        match self.screen {
+            Screen::Episodes => {
+                let anime = self.cached_detail()?;
+                let episode = anime.episodes.get(self.selected_row()?)?;
+                Some((anime.title.clone(), Some(episode.number)))
+            }
+            Screen::LiveEpisodes => {
+                let number = self.episode_number(self.selected_row()?);
+                let anime = self.live_detail()?;
+                Some((anime.display_title().to_string(), Some(number)))
+            }
+            Screen::MovieDetail => {
+                let anime = self.cached_detail()?;
+                Some((anime.title.clone(), None))
+            }
+            Screen::Watched => {
+                let watch = self.selected_watch()?;
+                Some((watch.title.clone(), watch.episode))
+            }
+            _ => None,
+        }
+    }
+
+    /// The play the highlight is on, looked up through the view so a sorted or
+    /// filtered history acts on the row it appears to be pointing at.
+    pub(crate) fn selected_watch(&self) -> Option<&Watch> {
+        self.watched()
+            .get(self.visible_watched().get(self.watch_index).copied()?)
+    }
+
+    fn raise(&mut self, error: anyhow::Error) {
+        self.error = Some(format!("{error:#}"));
+        self.enter(Screen::Error);
     }
 
     /// Whether a filter is being typed, which changes both what the keys mean
@@ -632,6 +807,7 @@ impl App {
             Screen::Search if self.search_focus == SearchFocus::Results => Some(&self.listing_view),
             Screen::Episodes | Screen::LiveEpisodes => Some(&self.episodes_view),
             Screen::SeasonPicker => Some(&self.seasons_view),
+            Screen::Watched => Some(&self.watched_view),
             _ => None,
         }
     }
@@ -644,6 +820,7 @@ impl App {
             }
             Screen::Episodes | Screen::LiveEpisodes => Some(&mut self.episodes_view),
             Screen::SeasonPicker => Some(&mut self.seasons_view),
+            Screen::Watched => Some(&mut self.watched_view),
             _ => None,
         }
     }
@@ -654,6 +831,7 @@ impl App {
             Screen::Listing | Screen::Search => Some(self.visible_listing()),
             Screen::Episodes | Screen::LiveEpisodes => Some(self.visible_episodes()),
             Screen::SeasonPicker => Some(self.visible_seasons()),
+            Screen::Watched => Some(self.visible_watched()),
             _ => None,
         }
     }
@@ -663,6 +841,7 @@ impl App {
             Screen::Listing | Screen::Search => Some(&mut self.list_index),
             Screen::Episodes | Screen::LiveEpisodes => Some(&mut self.episode_index),
             Screen::SeasonPicker => Some(&mut self.season_index),
+            Screen::Watched => Some(&mut self.watch_index),
             _ => None,
         }
     }
@@ -674,6 +853,7 @@ impl App {
             Screen::Listing | Screen::Search => self.list_index,
             Screen::Episodes | Screen::LiveEpisodes => self.episode_index,
             Screen::SeasonPicker => self.season_index,
+            Screen::Watched => self.watch_index,
             _ => return None,
         };
         self.visible()?.get(index).copied()
@@ -710,6 +890,10 @@ impl App {
         self.seasons_view.order(&self.season_keys())
     }
 
+    pub(crate) fn visible_watched(&self) -> Vec<usize> {
+        self.watched_view.order(&self.watch_keys())
+    }
+
     /// The keys behind the list on screen, for the keys that need to know what
     /// the whole list holds rather than only what it is showing.
     fn active_keys(&self) -> Vec<RowKeys> {
@@ -717,6 +901,7 @@ impl App {
             Screen::Listing | Screen::Search => self.listing_keys(),
             Screen::Episodes | Screen::LiveEpisodes => self.episode_keys(),
             Screen::SeasonPicker => self.season_keys(),
+            Screen::Watched => self.watch_keys(),
             _ => Vec::new(),
         }
     }
@@ -769,6 +954,29 @@ impl App {
             .collect()
     }
 
+    /// The history keys by title rather than by row, so `n` groups a show's
+    /// episodes together and `f` finds them by name. The check stands in for the
+    /// type column, which makes `t` step between the plays still marked and the
+    /// ones Alt-D cleared.
+    fn watch_keys(&self) -> Vec<RowKeys> {
+        self.watched()
+            .iter()
+            .map(|watch| {
+                RowKeys::new(
+                    watch.title.clone(),
+                    Some(watch.watched_at.format("%Y-%m-%d").to_string()),
+                )
+                .with_kind(Some(
+                    match watch.marked {
+                        true => "checked",
+                        false => "cleared",
+                    }
+                    .to_string(),
+                ))
+            })
+            .collect()
+    }
+
     fn move_selection(&mut self, direction: isize) {
         match self.screen {
             Screen::Home => {
@@ -784,6 +992,10 @@ impl App {
             Screen::SeasonPicker => {
                 let count = self.visible_seasons().len();
                 move_index(&mut self.season_index, count, direction);
+            }
+            Screen::Watched => {
+                let count = self.visible_watched().len();
+                move_index(&mut self.watch_index, count, direction);
             }
             Screen::Episodes => {
                 let count = self.visible_episodes().len();
@@ -816,6 +1028,8 @@ impl App {
                 match entries.remove(self.home_index).choice {
                     HomeChoice::Load(action) => self.queue(action),
                     HomeChoice::Search => self.enter_search(),
+                    HomeChoice::Favourites => self.open_favourites(),
+                    HomeChoice::Watched => self.open_watched(),
                     HomeChoice::Quit => self.request_quit(),
                 }
             }
@@ -838,6 +1052,18 @@ impl App {
                 if let Some(season) = season {
                     self.queue(Action::Season(season));
                 }
+            }
+            // The history plays what it lists. It carries the origin the row was
+            // played from, so a title recorded live is asked for live — and says
+            // so plainly if the current mode cannot reach it.
+            Screen::Watched => {
+                let Some(watch) = self.selected_watch() else {
+                    return;
+                };
+                let request =
+                    self.playback
+                        .request(watch.origin.clone(), watch.title.clone(), watch.episode);
+                self.queue(Action::Play(request));
             }
             // A catalog series plays the highlighted episode; a movie has none.
             Screen::Episodes => {
@@ -1069,7 +1295,7 @@ mod tests {
     use crate::mode::Mode;
     use crate::playback::{Playback, TrackPrefs};
     use crate::source::{AnimeSummary, SeasonRef, Source};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     /// Built from the repo's own catalog in cached mode, so nothing here needs
     /// the network.
@@ -1083,12 +1309,33 @@ mod tests {
             "true".to_string(),
         )
         .expect("playback builds");
-        // Nothing here queries a terminal, so the fallback renderer stands in.
-        App::new(source, playback, Renderer::halfblocks())
+        // Nothing here queries a terminal, so the fallback renderer stands in,
+        // and the library is a scratch file rather than the real one.
+        App::new(
+            source,
+            playback,
+            crate::library::scratch(),
+            Renderer::halfblocks(),
+        )
     }
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::from(code));
+    }
+
+    fn alt(app: &mut App, character: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT));
+    }
+
+    /// Opens a menu entry by name, so the tests do not carry the menu's order.
+    fn open_home_entry(app: &mut App, label: &str) {
+        app.screen = Screen::Home;
+        app.home_index = app
+            .home_labels()
+            .iter()
+            .position(|entry| *entry == label)
+            .unwrap_or_else(|| panic!("{label} is on the menu"));
+        press(app, KeyCode::Enter);
     }
 
     #[tokio::test]
@@ -1332,6 +1579,158 @@ mod tests {
         app.show_listing("Airing now", vec![summary(4, "Frieren", "2023-09-29")]);
         assert!(!app.filtering());
         assert_eq!(titles(&app), ["Frieren"]);
+    }
+
+    /// Both lists belong to the user rather than to a source, so they are on
+    /// the menu whatever the mode is reading from — this app is a cached one.
+    #[tokio::test]
+    async fn the_home_menu_offers_both_lists() {
+        let app = app().await;
+        let labels = app.home_labels();
+        assert!(labels.contains(&"Favourites"), "{labels:?}");
+        assert!(labels.contains(&"Previously watched"), "{labels:?}");
+    }
+
+    #[tokio::test]
+    async fn b_stars_the_highlighted_title_and_a_second_press_unstars_it() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.library().is_favourite("Cowboy Bebop"));
+        // Only the highlighted row, not the list.
+        assert!(!app.library().is_favourite("attack on titan"));
+        assert!(app.listing[0].row_marked(true).contains('★'));
+
+        press(&mut app, KeyCode::Char('b'));
+        assert!(!app.library().is_favourite("Cowboy Bebop"));
+    }
+
+    /// A sorted list moves the rows under the highlight, so `b` has to star the
+    /// row on screen rather than the one at that position in the data.
+    #[tokio::test]
+    async fn b_stars_the_row_the_highlight_is_on_after_a_sort() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(selected_title(&app), "Cowboy Bebop");
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.library().is_favourite("Cowboy Bebop"));
+    }
+
+    #[tokio::test]
+    async fn the_favourites_screen_holds_what_was_starred_and_drops_what_is_unstarred() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('b'));
+
+        open_home_entry(&mut app, "Favourites");
+        assert_eq!(app.screen, Screen::Listing);
+        let starred = titles(&app);
+        assert_eq!(starred.len(), 2, "{starred:?}");
+        assert!(starred.contains(&"Cowboy Bebop".to_string()), "{starred:?}");
+
+        // Unstarring on the favourites list has to take the row off it, or the
+        // screen keeps drawing something that is no longer a favourite.
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(titles(&app).len(), 1);
+    }
+
+    /// The star is the user's, not the source's, so it has to survive a title
+    /// arriving under a different origin than the one it was starred from.
+    #[tokio::test]
+    async fn a_star_holds_when_the_same_title_arrives_from_another_origin() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('b'));
+
+        app.listing = vec![AnimeSummary {
+            origin: Origin::Cached("cowboy-bebop".into()),
+            ..summary(9, "cowboy bebop", "1998-04-03")
+        }];
+        assert!(app.library().is_favourite(&app.listing[0].title));
+    }
+
+    #[tokio::test]
+    async fn alt_d_clears_the_check_on_the_highlighted_episode_and_puts_it_back() {
+        let mut app = app().await;
+        app.run_action(Action::Detail(Origin::Cached("frieren".into())))
+            .await
+            .expect("the catalog has it");
+        assert_eq!(app.screen, Screen::Episodes);
+
+        let title = app.cached_detail().expect("a series").title.clone();
+        app.library_mut()
+            .record_watch(&Origin::Cached("frieren".into()), &title, Some(1))
+            .expect("saves");
+        assert!(app.library().is_marked(&title, Some(1)));
+
+        alt(&mut app, 'd');
+        assert!(!app.library().is_marked(&title, Some(1)));
+        // The play itself stays: only the check was cleared.
+        assert_eq!(app.library().watched().len(), 1);
+
+        alt(&mut app, 'd');
+        assert!(app.library().is_marked(&title, Some(1)));
+    }
+
+    /// `d` sorts by date everywhere, so Alt-D has to be read before it rather
+    /// than reordering the list it was meant to mark.
+    #[tokio::test]
+    async fn alt_d_does_not_reach_the_date_sort() {
+        let mut app = app().await;
+        listing(&mut app);
+        alt(&mut app, 'd');
+        assert_eq!(titles(&app)[0], "Cowboy Bebop");
+    }
+
+    /// macOS terminals that do not send Option as a modifier send this instead.
+    #[tokio::test]
+    async fn option_d_is_read_as_alt_d_where_the_terminal_sends_a_letter() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('∂'));
+        assert_eq!(titles(&app)[0], "Cowboy Bebop");
+        assert_eq!(app.screen, Screen::Listing);
+    }
+
+    /// `b` is an ordinary letter while a filter is being typed, like `q` and
+    /// the rest — otherwise a filter cannot be typed without starring things.
+    #[tokio::test]
+    async fn b_types_into_a_filter_instead_of_starring() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('b'));
+        assert!(app.library().favourites().is_empty());
+        assert_eq!(titles(&app), ["Cowboy Bebop", "Bocchi the Rock!"]);
+    }
+
+    #[tokio::test]
+    async fn the_watched_screen_lists_the_plays_newest_first_and_replays_one() {
+        let mut app = app().await;
+        let origin = Origin::Live(1);
+        for episode in 1..=2 {
+            app.library_mut()
+                .record_watch(&origin, "Cowboy Bebop", Some(episode))
+                .expect("saves");
+        }
+
+        open_home_entry(&mut app, "Previously watched");
+        assert_eq!(app.screen, Screen::Watched);
+        assert_eq!(app.selected_watch().expect("a row").episode, Some(2));
+
+        press(&mut app, KeyCode::Enter);
+        match app.take_pending() {
+            Some(Action::Play(request)) => {
+                assert_eq!(request.title, "Cowboy Bebop");
+                assert_eq!(request.episode, Some(2));
+                // Replayed from where it was played, not from the current mode.
+                assert_eq!(request.origin, Origin::Live(1));
+            }
+            other => panic!("expected a replay, got {other:?}"),
+        }
     }
 
     #[test]

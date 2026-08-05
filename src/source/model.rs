@@ -4,9 +4,14 @@
 use crate::catalog::Anime;
 use crate::live::LiveAnime;
 use crate::live::model::Recommendation;
+use serde::{Deserialize, Serialize};
 
 /// Identifies a title and, with it, how its detail view is loaded.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Serialized as `{"cached": "id"}` or `{"live": 123}` so the library can
+/// reopen a starred row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Origin {
     /// A record in the local Deeb catalog, keyed by its catalog id.
     Cached(String),
@@ -20,17 +25,22 @@ impl Origin {
     }
 }
 
-/// One row in any listing screen.
-#[derive(Clone, Debug)]
+/// One row in any listing screen. A starred row is kept whole in the library,
+/// so the favourites screen draws the same columns without going back to the
+/// source for them — which is why this is serializable.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AnimeSummary {
     pub origin: Origin,
     pub title: String,
     pub kind: String,
     pub status: String,
+    #[serde(default)]
     pub score: Option<f64>,
+    #[serde(default)]
     pub episodes: Option<u32>,
     pub released: String,
     /// Extra context for the row, such as why a title was recommended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
@@ -105,12 +115,23 @@ impl AnimeSummary {
 
     /// The listing row rendered by both frontends, aligned to [`Self::header`].
     pub fn row(&self) -> String {
+        self.row_marked(false)
+    }
+
+    /// The same row, with a star after the title when it is one of the user's
+    /// favourites.
+    pub fn row_marked(&self, favourite: bool) -> String {
+        // A title-only row has no columns to line up with, so the star simply
+        // follows the title rather than eating into it.
         if self.is_bare() {
-            return self.title.clone();
+            return match favourite {
+                true => format!("{} ★", self.title),
+                false => self.title.clone(),
+            };
         }
         format!(
             "{:<42.42}  {:<8.8}  {:<9.9}  {:>5}  {:>4}  {}",
-            self.title,
+            self.title_cell(favourite),
             self.kind,
             self.status,
             self.score
@@ -121,6 +142,18 @@ impl AnimeSummary {
                 .unwrap_or_else(|| EMPTY.to_string()),
             self.released
         )
+    }
+
+    /// The title column. A starred title gives up two of its own characters to
+    /// the star rather than letting the column grow, so the rows around it still
+    /// line up under [`Self::header`].
+    fn title_cell(&self, favourite: bool) -> String {
+        if !favourite {
+            return self.title.clone();
+        }
+        let mut title: String = self.title.chars().take(TITLE_WIDTH - 2).collect();
+        title.push_str(" ★");
+        title
     }
 
     pub fn header() -> String {
@@ -157,6 +190,9 @@ impl SeasonRef {
 
 /// The dash shown wherever a source has nothing for a column.
 pub const EMPTY: &str = "—";
+
+/// The width of the title column, which the star has to fit inside.
+const TITLE_WIDTH: usize = 42;
 
 /// The API's status wording is long; these are the column-width equivalents.
 fn short_status(status: Option<&str>) -> String {

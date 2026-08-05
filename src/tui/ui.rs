@@ -2,6 +2,7 @@ use super::app::{App, Screen, SearchFocus};
 use super::preview::Preview;
 use super::view::ListView;
 use crate::catalog::Anime;
+use crate::library::{Library, Watch};
 use crate::live::model::Named;
 use crate::live::{LiveAnime, LiveEpisode};
 use crate::source::AnimeSummary;
@@ -41,6 +42,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Screen::Episodes => render_episodes(frame, app, chunks[1]),
         Screen::LiveEpisodes => render_live_episodes(frame, app, chunks[1]),
         Screen::MovieDetail => render_movie(frame, app, chunks[1]),
+        Screen::Watched => render_watched(frame, app, chunks[1]),
         // Overlay screens never reach `display_screen`.
         Screen::Playing | Screen::QuitConfirm | Screen::Error => {}
     }
@@ -109,11 +111,24 @@ fn render_home(frame: &mut Frame, app: &App, area: Rect) {
 fn render_listing(frame: &mut Frame, app: &App, area: Rect) {
     let title = listing_title(&app.listing_title, &app.listing);
     let order = app.visible_listing();
+    // An empty favourites list looks the same as a listing that failed to load,
+    // so it says what fills it instead.
+    let items = if app.listing.is_empty() && app.listing_title == "Favourites" {
+        vec![ListItem::new(Span::styled(
+            "No favourites yet. Press b on a title to star it.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        or_no_matches(
+            summary_items(&app.listing, &order, app.library()),
+            app.listing.len(),
+        )
+    };
     render_list(
         frame,
         area,
         &title,
-        or_no_matches(summary_items(&app.listing, &order), app.listing.len()),
+        items,
         app.list_index,
         Chrome::of(&app.listing_view, order.len(), app.listing.len()),
     );
@@ -180,7 +195,10 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         };
         vec![ListItem::new(message)]
     } else {
-        or_no_matches(summary_items(&app.listing, &order), app.listing.len())
+        or_no_matches(
+            summary_items(&app.listing, &order, app.library()),
+            app.listing.len(),
+        )
     };
 
     let title = listing_title("Results", &app.listing);
@@ -212,16 +230,22 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
                 .released_at
                 .map(|date| date.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| EMPTY.to_string());
-            ListItem::new(format!(
-                "{:>3}  {:<36}  {}",
-                episode.number, episode.title, released
-            ))
+            ListItem::new(Line::from(vec![
+                Span::raw(format!(
+                    "{:>3}  {:<36}  {released}",
+                    episode.number, episode.title
+                )),
+                watched_check(app.library(), &anime.title, Some(episode.number)),
+            ]))
         })
         .collect::<Vec<_>>();
     render_list(
         frame,
         area,
-        &format!("{} — episodes", anime.title),
+        &format!(
+            "{} — episodes",
+            starred(&anime.title, app.library().is_favourite(&anime.title))
+        ),
         or_no_matches(items, anime.episodes.len()),
         app.episode_index,
         Chrome::of(&app.episodes_view, order.len(), anime.episodes.len()),
@@ -235,23 +259,39 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
 /// bare numbering for the rest, so every episode the title reports stays
 /// selectable even when the list is short.
 fn render_live_episodes(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(title) = app
+    let Some(name) = app
         .live_detail()
-        .map(|anime| format!("{} — episodes", anime.display_title()))
+        .map(|anime| anime.display_title().to_string())
     else {
         return;
     };
+    let starred_name = starred(&name, app.library().is_favourite(&name));
+    let title = format!("{starred_name} — episodes");
     let (list_area, side) = split_episode_area(app, area);
 
-    let width = list_area.width.saturating_sub(4) as usize;
+    // The row fills exactly the width it is given, so the borders, the
+    // highlight symbol, and the check column all have to come off it first —
+    // otherwise the check is the thing that falls off the end.
+    let width = list_area.width.saturating_sub(4 + CHECK_COLUMN) as usize;
     let total = app.live_episode_count();
     let order = app.visible_episodes();
     let items = order
         .iter()
-        .map(|index| match app.episode(*index) {
-            Some(episode) => ListItem::new(episode_row(episode, width)),
-            // Numbered from its place in the series, not its place on screen.
-            None => ListItem::new(format!("{:>3}  Episode {}", index + 1, index + 1)),
+        .map(|index| {
+            // The episode a row plays is the number the API gave it where the
+            // fetched list reached it, so the check has to key off the same one.
+            let number = app
+                .episode(*index)
+                .map_or(*index as u32 + 1, |episode| episode.mal_id);
+            let check = watched_check(app.library(), &name, Some(number));
+            let mut line = match app.episode(*index) {
+                Some(episode) => episode_row(episode, width),
+                // Numbered from its place in the series, not on screen.
+                None => Line::from(format!("{:>3}  Episode {}", index + 1, index + 1)),
+            };
+            line.push_span(Span::raw("  "));
+            line.push_span(check);
+            ListItem::new(line)
         })
         .collect::<Vec<_>>();
     render_list(
@@ -415,6 +455,30 @@ fn episode_row(episode: &LiveEpisode, width: usize) -> Line<'static> {
     ])
 }
 
+/// What the check costs a row: two spaces and the mark itself.
+const CHECK_COLUMN: u16 = 3;
+
+/// The mark beside an episode that has been played. A cleared mark draws a
+/// blank of the same width, so clearing one does not shift the rows around it.
+fn watched_check(library: &Library, title: &str, episode: Option<u32>) -> Span<'static> {
+    Span::styled(
+        match library.is_marked(title, episode) {
+            true => "✓",
+            false => " ",
+        },
+        Style::default().fg(Color::Green),
+    )
+}
+
+/// A title with the favourite star after it, for the headings and detail panes
+/// that show one title rather than a column of them.
+fn starred(title: &str, favourite: bool) -> String {
+    match favourite {
+        true => format!("{title} ★"),
+        false => title.to_string(),
+    }
+}
+
 /// Episode scores are out of 5 and cluster high, so the bands are set where a
 /// glance down the column separates the standouts from the rest.
 fn score_color(score: Option<f64>) -> Color {
@@ -431,34 +495,47 @@ fn render_movie(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     frame.render_widget(
-        Paragraph::new(cached_movie_lines(anime))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Movie details "),
-            )
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(cached_movie_lines(
+            anime,
+            app.library().is_favourite(&anime.title),
+            app.library().is_marked(&anime.title, None),
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Movie details "),
+        )
+        .wrap(Wrap { trim: true }),
         area,
     );
 }
 
-fn cached_movie_lines(anime: &Anime) -> Vec<Line<'static>> {
+fn cached_movie_lines(anime: &Anime, favourite: bool, watched: bool) -> Vec<Line<'static>> {
     let released = anime
         .latest_release_at
         .map(|date| date.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| EMPTY.to_string());
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled(
-            anime.title.clone(),
+            starred(&anime.title, favourite),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(format!("Status: {}", anime.status)),
         Line::from(format!("Released: {released}")),
+    ];
+    if watched {
+        lines.push(Line::from(Span::styled(
+            "✓ Watched",
+            Style::default().fg(Color::Green),
+        )));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(anime.description.clone()),
         Line::from(""),
         Line::from("Press Enter to play."),
-    ]
+    ]);
+    lines
 }
 
 /// Renders `/anime/{id}/full`. Lines are wrapped up front so the scroll offset
@@ -467,9 +544,16 @@ fn render_live_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(anime) = app.live_detail() else {
         return;
     };
-    let title = format!(" {} ", truncate(anime.display_title(), area.width as usize));
+    let favourite = app.library().is_favourite(anime.display_title());
+    let title = format!(
+        " {} ",
+        truncate(
+            &starred(anime.display_title(), favourite),
+            area.width as usize
+        )
+    );
     let width = area.width.saturating_sub(2).max(10) as usize;
-    let lines = live_detail_lines(anime, width);
+    let lines = live_detail_lines(anime, favourite, width);
 
     let visible = area.height.saturating_sub(2);
     let max_scroll = (lines.len() as u16).saturating_sub(visible);
@@ -493,9 +577,9 @@ fn render_live_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn live_detail_lines(anime: &LiveAnime, width: usize) -> Vec<Line<'static>> {
+fn live_detail_lines(anime: &LiveAnime, favourite: bool, width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        anime.display_title().to_string(),
+        starred(anime.display_title(), favourite),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -791,21 +875,83 @@ fn render_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn summary_items(rows: &[AnimeSummary], order: &[usize]) -> Vec<ListItem<'static>> {
+fn summary_items(
+    rows: &[AnimeSummary],
+    order: &[usize],
+    library: &Library,
+) -> Vec<ListItem<'static>> {
     order
         .iter()
         .filter_map(|index| rows.get(*index))
         .map(|row| match &row.note {
             Some(note) => ListItem::new(vec![
-                Line::from(row.row()),
+                Line::from(row.row_marked(library.is_favourite(&row.title))),
                 Line::from(Span::styled(
                     format!("    {note}"),
                     Style::default().fg(Color::DarkGray),
                 )),
             ]),
-            None => ListItem::new(row.row()),
+            None => ListItem::new(row.row_marked(library.is_favourite(&row.title))),
         })
         .collect()
+}
+
+/// `Frieren                        Ep   3  ✓  2026-08-05`. The check is the one
+/// Alt-D clears, so it is drawn here too rather than only in the pickers.
+fn watch_items(rows: &[Watch], order: &[usize], library: &Library) -> Vec<ListItem<'static>> {
+    order
+        .iter()
+        .filter_map(|index| rows.get(*index))
+        .map(|watch| {
+            let episode = match watch.episode {
+                Some(number) => format!("Ep {number:>3}"),
+                None => "Movie".to_string(),
+            };
+            let title = match library.is_favourite(&watch.title) {
+                true => format!("{} ★", watch.title),
+                false => watch.title.clone(),
+            };
+            Line::from(vec![
+                Span::raw(format!("{:<44.44}  {episode:>6}  ", title)),
+                Span::styled(
+                    match watch.marked {
+                        true => "✓",
+                        false => " ",
+                    },
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("  {}", watch.watched_at.format("%Y-%m-%d")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .map(ListItem::new)
+        .collect()
+}
+
+fn render_watched(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.watched();
+    let order = app.visible_watched();
+    let items = if rows.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "Nothing played yet. Episodes land here as you play them.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        or_no_matches(watch_items(rows, &order, app.library()), rows.len())
+    };
+    render_list(
+        frame,
+        area,
+        &format!(
+            "Previously watched — {:<44}  {:>6}     {}",
+            "TITLE", "EPISODE", "WATCHED"
+        ),
+        items,
+        app.watch_index,
+        Chrome::of(&app.watched_view, order.len(), rows.len()),
+    );
 }
 
 fn help_text(app: &App) -> &'static str {
@@ -818,25 +964,32 @@ fn help_text(app: &App) -> &'static str {
     match app.screen {
         Screen::Home => "↑/↓ select • Enter open • / Search • p Provider • a Auto • q Quit",
         Screen::Search if app.search_focus == SearchFocus::Results => {
-            "↑/↓ select • Enter open • f Filter • t Type • d Date • n Name • / query • Esc back"
+            "↑/↓ select • Enter open • b Star • f Filter • t Type • d Date • n Name • / query • Esc back"
         }
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
         Screen::SeasonPicker => {
             "↑/↓ or j/k select • Enter open • f Filter • d Date • n Name • p Provider • Esc back"
         }
-        Screen::LiveDetail => "↑/↓ or j/k scroll • Enter play • p Provider • a Auto • Esc back",
+        Screen::LiveDetail => {
+            "↑/↓ or j/k scroll • Enter play • b Star • p Provider • a Auto • Esc back"
+        }
         Screen::LiveEpisodes => {
-            "↑/↓ or j/k select • Enter play • f Filter • d Date • n Name • v Image • s Synopsis • p Provider • Esc back"
+            "↑/↓ or j/k select • Enter play • b Star • Alt-d Check • f Filter • d Date • n Name • v Image • s Synopsis • Esc back"
         }
         Screen::Episodes => {
-            "↑/↓ or j/k select • Enter play • f Filter • d Date • n Name • p Provider • a Auto • Esc back"
+            "↑/↓ or j/k select • Enter play • b Star • Alt-d Check • f Filter • d Date • n Name • p Provider • Esc back"
         }
-        Screen::MovieDetail => "↑/↓ or j/k select • Enter play • p Provider • a Auto • Esc back",
+        Screen::MovieDetail => {
+            "↑/↓ or j/k select • Enter play • b Star • Alt-d Check • p Provider • a Auto • Esc back"
+        }
+        Screen::Watched => {
+            "↑/↓ or j/k select • Enter replay • Alt-d Check • f Filter • t Check • d Date • n Name • Esc back"
+        }
         Screen::Playing => "Any key to dismiss",
         Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         Screen::Error => "Any key to dismiss",
         Screen::Listing => {
-            "↑/↓ select • Enter open • f Filter • t Type • d Date • n Name • / Search • p Provider • a Auto • Esc back"
+            "↑/↓ select • Enter open • b Star • f Filter • t Type • d Date • n Name • / Search • p Provider • Esc back"
         }
     }
 }
@@ -982,8 +1135,8 @@ mod tests {
     use crate::live::{LiveAnime, LiveEpisode};
     use crate::mode::Mode;
     use crate::playback::{Playback, TrackPrefs};
-    use crate::source::{AnimeDetail, Source};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crate::source::{AnimeDetail, AnimeSummary, Origin, Source};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
 
     async fn app() -> App {
@@ -997,7 +1150,12 @@ mod tests {
         )
         .expect("playback builds");
         // Nothing here queries a terminal, so the fallback renderer stands in.
-        App::new(source, playback, Renderer::halfblocks())
+        App::new(
+            source,
+            playback,
+            crate::library::scratch(),
+            Renderer::halfblocks(),
+        )
     }
 
     fn header(app: &App) -> String {
@@ -1104,6 +1262,72 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The star is the whole point of the feature being visible, so it has to
+    /// reach the buffer rather than only the model.
+    #[tokio::test]
+    async fn a_starred_title_draws_a_star_after_its_name() {
+        let mut app = app().await;
+        app.listing = vec![AnimeSummary {
+            origin: Origin::Live(52991),
+            title: "Frieren".into(),
+            kind: "TV".into(),
+            status: "Finished".into(),
+            score: Some(9.3),
+            episodes: Some(28),
+            released: "2023-09-29".into(),
+            note: None,
+        }];
+        app.screen = Screen::Listing;
+        assert!(!draw(&mut app, 120, 20).contains('★'));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('b')));
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("Frieren ★"), "{screen}");
+        // The star sits inside the title column, so the ones after it hold.
+        assert!(screen.contains("9.30"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn a_played_episode_draws_a_check_until_alt_d_clears_it() {
+        let mut app = app().await;
+        frieren(&mut app, 2);
+        app.library_mut()
+            .record_watch(&Origin::Live(52991), "Frieren", Some(1))
+            .expect("saves");
+
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains('✓'), "{screen}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        let cleared = draw(&mut app, 120, 20);
+        assert!(!cleared.contains('✓'), "{cleared}");
+    }
+
+    /// An empty history is not a screen that failed to load, and it should say
+    /// what fills it.
+    #[tokio::test]
+    async fn the_watched_screen_explains_itself_when_nothing_has_been_played() {
+        let mut app = app().await;
+        app.screen = Screen::Watched;
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("Previously watched"), "{screen}");
+        assert!(screen.contains("Nothing played yet"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn the_watched_screen_draws_the_title_episode_and_when() {
+        let mut app = app().await;
+        app.library_mut()
+            .record_watch(&Origin::Live(52991), "Frieren", Some(3))
+            .expect("saves");
+        app.screen = Screen::Watched;
+
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("Frieren"), "{screen}");
+        assert!(screen.contains("Ep   3"), "{screen}");
+        assert!(screen.contains('✓'), "{screen}");
     }
 
     #[tokio::test]

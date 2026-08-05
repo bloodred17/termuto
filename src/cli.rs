@@ -1,4 +1,5 @@
 use crate::catalog::AnimeKind;
+use crate::library::{Library, resolve_library_path};
 use crate::mode::{MODE_ENV, Mode, resolve_mode};
 use crate::playback::{
     Audio, PROVIDER_ENV, Playback, Quality, Switch, resolve_autoswitch, resolve_player,
@@ -25,6 +26,11 @@ pub struct Cli {
     /// Path to the Deeb JSON catalog (defaults to TERMUTO_CATALOG or ~/.termuto/catalog.json)
     #[arg(long, global = true, value_name = "PATH")]
     pub catalog: Option<PathBuf>,
+
+    /// Path to the favourites and watch history (defaults to TERMUTO_LIBRARY or
+    /// ~/.termuto/library.json)
+    #[arg(long, global = true, value_name = "PATH")]
+    pub library: Option<PathBuf>,
 
     /// Which audio track playback asks for (defaults to TERMUTO_AUDIO or sub)
     #[arg(long, global = true, value_name = "AUDIO", value_enum)]
@@ -121,7 +127,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        None | Some(Command::Tui) => tui::run(source, playback).await,
+        None | Some(Command::Tui) => {
+            let library = Library::open(resolve_library_path(cli.library));
+            if let Some(issue) = library.issue() {
+                eprintln!("warning: starting with empty lists — {issue}");
+            }
+            tui::run(source, playback, library).await
+        }
         Some(Command::Top { limit }) => {
             print_listing(&format!("Top anime ({mode})"), &source.top(limit).await?);
             Ok(())

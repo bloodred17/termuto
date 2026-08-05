@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod cli;
+pub mod library;
 pub mod live;
 pub mod mode;
 pub mod playback;
