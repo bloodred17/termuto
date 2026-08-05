@@ -472,6 +472,7 @@ impl App {
             }
             // No-ops on a screen without a list, like the toggles above.
             KeyCode::Char('f') => self.begin_filter(),
+            KeyCode::Char('t') => self.cycle_kind(),
             KeyCode::Char('d') => self.sort_by(SortKey::Date),
             KeyCode::Char('n') => self.sort_by(SortKey::Name),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -535,6 +536,7 @@ impl App {
             // The query is what the API was asked; these narrow and reorder
             // what came back, without spending another request.
             (SearchFocus::Results, KeyCode::Char('f')) => self.begin_filter(),
+            (SearchFocus::Results, KeyCode::Char('t')) => self.cycle_kind(),
             (SearchFocus::Results, KeyCode::Char('d')) => self.sort_by(SortKey::Date),
             (SearchFocus::Results, KeyCode::Char('n')) => self.sort_by(SortKey::Name),
             (SearchFocus::Results, KeyCode::Up | KeyCode::Char('k')) => {
@@ -603,6 +605,15 @@ impl App {
     fn sort_by(&mut self, key: SortKey) {
         let selected = self.selected_row();
         self.with_view(|view| view.sort_by(key));
+        self.follow_selection(selected);
+    }
+
+    /// A list whose rows carry no type has none to cycle through, so this is a
+    /// no-op on the episode pickers and the season index.
+    fn cycle_kind(&mut self) {
+        let selected = self.selected_row();
+        let keys = self.active_keys();
+        self.with_view(|view| view.cycle_kind(&keys));
         self.follow_selection(selected);
     }
 
@@ -699,10 +710,23 @@ impl App {
         self.seasons_view.order(&self.season_keys())
     }
 
+    /// The keys behind the list on screen, for the keys that need to know what
+    /// the whole list holds rather than only what it is showing.
+    fn active_keys(&self) -> Vec<RowKeys> {
+        match self.screen {
+            Screen::Listing | Screen::Search => self.listing_keys(),
+            Screen::Episodes | Screen::LiveEpisodes => self.episode_keys(),
+            Screen::SeasonPicker => self.season_keys(),
+            _ => Vec::new(),
+        }
+    }
+
     fn listing_keys(&self) -> Vec<RowKeys> {
         self.listing
             .iter()
-            .map(|row| RowKeys::new(row.title.clone(), sortable_date(&row.released)))
+            .map(|row| {
+                RowKeys::new(row.title.clone(), column(&row.released)).with_kind(column(&row.kind))
+            })
             .collect()
     }
 
@@ -1009,12 +1033,12 @@ impl App {
     }
 }
 
-/// The released column as something the date sort can compare. Sources write
-/// the dash when they have nothing, and a row with nothing sorts last rather
-/// than under a literal `—`.
-fn sortable_date(released: &str) -> Option<String> {
-    let released = released.trim();
-    (!released.is_empty() && released != EMPTY).then(|| released.to_string())
+/// What a column actually holds. Sources write the dash where they have
+/// nothing, and a row with nothing belongs outside the sort and outside every
+/// type rather than under a literal `—`.
+fn column(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty() && text != EMPTY).then(|| text.to_string())
 }
 
 /// Where a season falls in its year. `/seasons` names them, and names put fall
@@ -1044,7 +1068,7 @@ mod tests {
     use super::{Action, App, Origin, Renderer, Screen, move_index};
     use crate::mode::Mode;
     use crate::playback::{Playback, TrackPrefs};
-    use crate::source::{AnimeSummary, Source};
+    use crate::source::{AnimeSummary, SeasonRef, Source};
     use crossterm::event::{KeyCode, KeyEvent};
 
     /// Built from the repo's own catalog in cached mode, so nothing here needs
@@ -1179,6 +1203,62 @@ mod tests {
             Some(Action::Detail(Origin::Live(mal_id))) => assert_eq!(mal_id, 1),
             other => panic!("expected the Cowboy Bebop detail, got {other:?}"),
         }
+    }
+
+    /// Cycling means the key alone gets back to the whole list, so there is no
+    /// way to strand the screen on a type.
+    #[tokio::test]
+    async fn t_steps_the_listing_through_its_types_and_back_to_all_of_them() {
+        let mut app = app().await;
+        listing(&mut app);
+        app.listing.push(summary(4, "Akira", "1988-07-16"));
+        app.listing[3].kind = "Movie".into();
+
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(titles(&app), ["Akira"]);
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(titles(&app).len(), 3);
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(titles(&app).len(), 4);
+    }
+
+    /// The type filter and the typed filter narrow together rather than
+    /// replacing one another.
+    #[tokio::test]
+    async fn a_type_and_a_typed_filter_both_apply() {
+        let mut app = app().await;
+        listing(&mut app);
+        app.listing
+            .push(summary(4, "Bocchi the Movie", "2024-06-07"));
+        app.listing[3].kind = "Movie".into();
+
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('B'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            titles(&app),
+            ["Cowboy Bebop", "Bocchi the Rock!", "Bocchi the Movie"]
+        );
+
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(titles(&app), ["Bocchi the Movie"]);
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(titles(&app), ["Cowboy Bebop", "Bocchi the Rock!"]);
+    }
+
+    /// An episode picker has no type column, so `t` there must not silently
+    /// empty the list.
+    #[tokio::test]
+    async fn t_leaves_a_list_without_types_alone() {
+        let mut app = app().await;
+        listing(&mut app);
+        app.screen = Screen::SeasonPicker;
+        app.seasons = vec![SeasonRef {
+            year: 2023,
+            season: "fall".into(),
+        }];
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.visible_seasons(), vec![0]);
     }
 
     #[tokio::test]

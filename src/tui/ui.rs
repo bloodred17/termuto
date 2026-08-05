@@ -818,7 +818,7 @@ fn help_text(app: &App) -> &'static str {
     match app.screen {
         Screen::Home => "↑/↓ select • Enter open • / Search • p Provider • a Auto • q Quit",
         Screen::Search if app.search_focus == SearchFocus::Results => {
-            "↑/↓ select • Enter open • f Filter • d Date • n Name • / query • Esc back"
+            "↑/↓ select • Enter open • f Filter • t Type • d Date • n Name • / query • Esc back"
         }
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
         Screen::SeasonPicker => {
@@ -836,7 +836,7 @@ fn help_text(app: &App) -> &'static str {
         Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         Screen::Error => "Any key to dismiss",
         Screen::Listing => {
-            "↑/↓ select • Enter open • f Filter • d Date • n Name • / Search • p Provider • a Auto • Esc back"
+            "↑/↓ select • Enter open • f Filter • t Type • d Date • n Name • / Search • p Provider • a Auto • Esc back"
         }
     }
 }

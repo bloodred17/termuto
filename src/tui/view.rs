@@ -1,15 +1,16 @@
 //! Sorting and filtering for the list screens.
 //!
 //! Every list keeps its rows in whatever order its source gave them and layers
-//! a view on top: `n` orders by name, `d` by date, and `f` narrows the rows to
-//! the ones whose name matches what is typed. The view never touches the rows
+//! a view on top: `n` orders by name, `d` by date, `f` narrows the rows to the
+//! ones whose name matches what is typed, and `t` steps through the types the
+//! list holds. The two filters narrow together. The view never touches the rows
 //! themselves — it produces the positions to draw, in the order to draw them —
 //! so a filtered listing still opens the title it appears to be pointing at.
 
 use std::cmp::Ordering;
 
-/// What a row gives the view: the text `n` orders and `f` matches against, and
-/// the date `d` orders by.
+/// What a row gives the view: the text `n` orders and `f` matches against, the
+/// date `d` orders by, and the type `t` steps through.
 pub(crate) struct RowKeys {
     pub(crate) name: String,
     /// Dates arrive already formatted `YYYY-MM-DD`, which orders correctly as
@@ -17,6 +18,9 @@ pub(crate) struct RowKeys {
     /// broadcast season keeps that label and sorts after the dated rows — the
     /// best a string comparison can do, and better than dropping it.
     pub(crate) date: Option<String>,
+    /// `TV`, `Movie`, `OVA` — whatever the source called it. `None` on a list
+    /// with no such column, which is what makes `t` a no-op there.
+    pub(crate) kind: Option<String>,
 }
 
 impl RowKeys {
@@ -24,7 +28,13 @@ impl RowKeys {
         Self {
             name: name.into(),
             date,
+            kind: None,
         }
+    }
+
+    pub(crate) fn with_kind(mut self, kind: Option<String>) -> Self {
+        self.kind = kind;
+        self
     }
 }
 
@@ -51,6 +61,8 @@ pub(crate) struct ListView {
     filter: String,
     /// Whether typing edits the filter rather than driving the list.
     editing: bool,
+    /// The one type of row being shown, or every type.
+    kind: Option<String>,
 }
 
 impl ListView {
@@ -91,15 +103,58 @@ impl ListView {
         self.filter.pop();
     }
 
+    /// Steps to the next type the list holds, and past the last one back to
+    /// showing every type. Cycling beats prompting for one: the column has a
+    /// handful of values, and they are already on screen to be read off.
+    pub(crate) fn cycle_kind(&mut self, rows: &[RowKeys]) {
+        let kinds = self.kinds(rows);
+        self.kind = match &self.kind {
+            None => kinds.first().cloned(),
+            // A type the list no longer holds — the name filter moved under it —
+            // gives everything back rather than stranding an empty screen.
+            Some(current) => match kinds.iter().position(|kind| kind == current) {
+                Some(position) => kinds.get(position + 1).cloned(),
+                None => None,
+            },
+        };
+    }
+
+    /// The types `t` steps through: the ones the name filter has left, so the
+    /// key never lands on a type with nothing under it.
+    fn kinds(&self, rows: &[RowKeys]) -> Vec<String> {
+        let mut kinds: Vec<String> = self
+            .named(rows)
+            .filter_map(|index| rows[index].kind.clone())
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        kinds
+    }
+
+    /// The rows the typed filter leaves, before the type filter narrows them.
+    fn named<'a>(&'a self, rows: &'a [RowKeys]) -> impl Iterator<Item = usize> + 'a {
+        let needle = self.filter.trim().to_lowercase();
+        (0..rows.len()).filter(move |index| {
+            needle.is_empty() || rows[*index].name.to_lowercase().contains(&needle)
+        })
+    }
+
+    fn shows(&self, row: &RowKeys) -> bool {
+        match &self.kind {
+            Some(kind) => row.kind.as_deref().is_some_and(|other| other == kind),
+            None => true,
+        }
+    }
+
     /// The rows to draw, as positions into `rows`, in the order to draw them.
     pub(crate) fn order(&self, rows: &[RowKeys]) -> Vec<usize> {
         // Names are folded once rather than per comparison: the filter, the
         // name sort, and the date tiebreak all want the same lowercased text.
         let names: Vec<String> = rows.iter().map(|row| row.name.to_lowercase()).collect();
-        let needle = self.filter.trim().to_lowercase();
 
-        let mut order: Vec<usize> = (0..rows.len())
-            .filter(|index| needle.is_empty() || names[*index].contains(&needle))
+        let mut order: Vec<usize> = self
+            .named(rows)
+            .filter(|index| self.shows(&rows[*index]))
             .collect();
 
         match self.key {
@@ -141,6 +196,9 @@ impl ListView {
         } else if !self.filter.trim().is_empty() {
             parts.push(format!("filter: {}", self.filter));
         }
+        if let Some(kind) = &self.kind {
+            parts.push(format!("type: {kind}"));
+        }
         if let Some(label) = self.sort_label() {
             parts.push(format!("sort: {label}"));
         }
@@ -169,9 +227,9 @@ mod tests {
 
     fn rows() -> Vec<RowKeys> {
         vec![
-            RowKeys::new("Cowboy Bebop", Some("1998-04-03".into())),
-            RowKeys::new("attack on titan", Some("2013-04-07".into())),
-            RowKeys::new("Bocchi the Rock!", None),
+            RowKeys::new("Cowboy Bebop", Some("1998-04-03".into())).with_kind(Some("TV".into())),
+            RowKeys::new("attack on titan", Some("2013-04-07".into())).with_kind(Some("TV".into())),
+            RowKeys::new("Bocchi the Rock!", None).with_kind(Some("Movie".into())),
         ]
     }
 
@@ -248,6 +306,48 @@ mod tests {
         view.cancel_filter();
         assert_eq!(names(&view, &rows()).len(), 3);
         assert!(!view.editing());
+    }
+
+    #[test]
+    fn t_steps_through_the_types_the_list_holds_and_back_to_all_of_them() {
+        let rows = rows();
+        let mut view = ListView::default();
+
+        view.cycle_kind(&rows);
+        assert_eq!(names(&view, &rows), ["Bocchi the Rock!"]);
+        view.cycle_kind(&rows);
+        assert_eq!(names(&view, &rows), ["Cowboy Bebop", "attack on titan"]);
+        // Past the last type, everything is back.
+        view.cycle_kind(&rows);
+        assert_eq!(names(&view, &rows).len(), 3);
+    }
+
+    /// The two filters narrow together, and the types on offer are only the
+    /// ones the typed filter has left — `t` never lands on an empty screen.
+    #[test]
+    fn the_type_cycle_only_offers_types_the_typed_filter_left() {
+        let rows = rows();
+        let mut view = ListView::default();
+        for character in "bo".chars() {
+            view.push_filter(character);
+        }
+        assert_eq!(names(&view, &rows), ["Cowboy Bebop", "Bocchi the Rock!"]);
+
+        view.cycle_kind(&rows);
+        assert_eq!(names(&view, &rows), ["Bocchi the Rock!"]);
+        view.cycle_kind(&rows);
+        assert_eq!(names(&view, &rows), ["Cowboy Bebop"]);
+    }
+
+    /// A list with no type column has nothing to step through, which is what
+    /// makes the key harmless on the episode pickers.
+    #[test]
+    fn t_does_nothing_to_a_list_without_types() {
+        let rows = vec![RowKeys::new("Episode 1", None)];
+        let mut view = ListView::default();
+        view.cycle_kind(&rows);
+        assert_eq!(names(&view, &rows), ["Episode 1"]);
+        assert_eq!(view.status(1, 1), None);
     }
 
     #[test]
