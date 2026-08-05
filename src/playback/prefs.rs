@@ -7,6 +7,50 @@ use std::str::FromStr;
 /// The environment variables consulted when the matching flag is absent.
 pub const AUDIO_ENV: &str = "TERMUTO_AUDIO";
 pub const QUALITY_ENV: &str = "TERMUTO_QUALITY";
+pub const AUTOSWITCH_ENV: &str = "TERMUTO_AUTOSWITCH";
+
+/// An on/off setting given on the command line. Parsed like the rest: an
+/// unrecognised value is reported rather than quietly treated as the default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum Switch {
+    #[default]
+    On,
+    Off,
+}
+
+impl Switch {
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+}
+
+impl fmt::Display for Switch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::On => formatter.pad("on"),
+            Self::Off => formatter.pad("off"),
+        }
+    }
+}
+
+impl FromStr for Switch {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Ok(Self::On),
+            "off" | "false" | "no" | "0" => Ok(Self::Off),
+            other => Err(format!("unknown setting \"{other}\" (expected on or off)")),
+        }
+    }
+}
+
+/// Resolution order matches the rest: the flag, then the environment variable,
+/// then on.
+pub fn resolve_autoswitch(option: Option<Switch>) -> Result<bool, String> {
+    resolve_field(option, AUTOSWITCH_ENV).map(Switch::is_on)
+}
 
 /// Which audio track a provider should resolve.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]

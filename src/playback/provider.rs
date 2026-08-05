@@ -96,6 +96,12 @@ pub struct ProviderChain {
     /// choosing one changes which host answers when several could, without
     /// costing the coverage of the others.
     preferred: Option<String>,
+    /// Whether a host that cannot serve a request hands over to the next one.
+    /// On by default: coverage differs per host, so falling through is what
+    /// makes a title the leading host lacks playable at all. Turning it off
+    /// pins playback to the chosen host, which is what you want when the
+    /// fallback is the wrong stream rather than no stream.
+    autoswitch: bool,
 }
 
 impl ProviderChain {
@@ -103,6 +109,7 @@ impl ProviderChain {
         Self {
             providers,
             preferred: None,
+            autoswitch: true,
         }
     }
 
@@ -165,8 +172,23 @@ impl ProviderChain {
         }
     }
 
+    /// Whether a host that cannot serve a request hands over to the next one.
+    pub fn autoswitch(&self) -> bool {
+        self.autoswitch
+    }
+
+    pub fn set_autoswitch(&mut self, on: bool) {
+        self.autoswitch = on;
+    }
+
+    /// Flips it, returning the new setting so a caller can report it.
+    pub fn toggle_autoswitch(&mut self) -> bool {
+        self.autoswitch = !self.autoswitch;
+        self.autoswitch
+    }
+
     /// The order this chain is actually consulted in: the preferred host first,
-    /// then everything else as declared.
+    /// then the others — unless autoswitch is off, which drops them.
     fn order(&self) -> Vec<&dyn StreamProvider> {
         let preferred = self.preferred();
         let leads = |provider: &&dyn StreamProvider| {
@@ -175,10 +197,12 @@ impl ProviderChain {
         let all = self.providers.iter().map(Box::as_ref);
         let (front, rest): (Vec<_>, Vec<_>) = all.partition(leads);
         // The catalog stays ahead of every host: it plays a local file, which
-        // beats a scrape whenever it has one.
+        // beats a scrape whenever it has one. It is not a host to switch
+        // between, so autoswitch has no say over it.
         let (local, remote): (Vec<_>, Vec<_>) =
             rest.into_iter().partition(|provider| !provider.is_remote());
-        local.into_iter().chain(front).chain(remote).collect()
+        let fallbacks = if self.autoswitch { remote } else { Vec::new() };
+        local.into_iter().chain(front).chain(fallbacks).collect()
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -186,6 +210,24 @@ impl ProviderChain {
             .iter()
             .map(|provider| provider.name())
             .collect()
+    }
+
+    /// Says so when hosts were held back, since "nothing could resolve this"
+    /// otherwise reads as "no host has it" when one of them might.
+    fn autoswitch_note(&self) -> String {
+        let held_back: Vec<&str> = self
+            .remote_names()
+            .into_iter()
+            .filter(|name| Some(*name) != self.preferred())
+            .collect();
+        if self.autoswitch || held_back.is_empty() {
+            return String::new();
+        }
+        format!(
+            "\nAutoswitch is off, so {} {} not tried.",
+            held_back.join(" and "),
+            if held_back.len() == 1 { "was" } else { "were" }
+        )
     }
 
     /// Tries each provider in turn. A provider that fails does not end the
@@ -201,17 +243,24 @@ impl ProviderChain {
             }
         }
 
+        let tried: Vec<&str> = self
+            .order()
+            .iter()
+            .map(|provider| provider.name())
+            .collect();
         if failures.is_empty() {
             bail!(
-                "No provider could resolve {}. Providers tried: {}.",
+                "No provider could resolve {}. Providers tried: {}.{}",
                 request.label(),
-                self.names().join(", ")
+                tried.join(", "),
+                self.autoswitch_note()
             );
         }
         bail!(
-            "No provider could resolve {}.\n{}",
+            "No provider could resolve {}.\n{}{}",
             request.label(),
-            failures.join("\n")
+            failures.join("\n"),
+            self.autoswitch_note()
         );
     }
 }
@@ -344,6 +393,58 @@ mod tests {
 
         let order: Vec<&str> = chain.order().iter().map(|p| p.name()).collect();
         assert_eq!(order, vec!["catalog", "megavid", "zokoanime"]);
+    }
+
+    /// Autoswitch is what makes a title the leading host lacks playable at all,
+    /// so it is on unless turned off.
+    #[test]
+    fn autoswitch_is_on_by_default_and_turning_it_off_drops_the_fallbacks() {
+        let mut chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        assert!(chain.autoswitch());
+        let order = |chain: &ProviderChain| -> Vec<String> {
+            chain
+                .order()
+                .iter()
+                .map(|provider| provider.name().to_string())
+                .collect()
+        };
+        assert_eq!(order(&chain), vec!["catalog", "zokoanime", "megavid"]);
+
+        assert!(!chain.toggle_autoswitch());
+        // The catalog is not a host to switch between, so it stays.
+        assert_eq!(order(&chain), vec!["catalog", "zokoanime"]);
+
+        // And the chosen host is the one that is kept, not merely the first.
+        chain.prefer("megavid").expect("a known host");
+        assert_eq!(order(&chain), vec!["catalog", "megavid"]);
+
+        assert!(chain.toggle_autoswitch());
+        assert_eq!(order(&chain), vec!["catalog", "megavid", "zokoanime"]);
+    }
+
+    /// "Nothing could resolve this" otherwise reads as "no host has it" when a
+    /// host that was held back might well have.
+    #[tokio::test]
+    async fn a_failure_with_autoswitch_off_says_what_was_held_back() {
+        let mut chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        chain.set_autoswitch(false);
+        let error = chain
+            .resolve(&request(Origin::Cached("solo-leveling".into())))
+            .await
+            .expect_err("no catalog, so nothing resolves");
+        let message = format!("{error:#}");
+        assert!(message.contains("Autoswitch is off"), "{message}");
+        assert!(message.contains("megavid was not tried"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_autoswitch_on_adds_no_such_note() {
+        let chain = ProviderChain::with_catalog(None).expect("the chain builds");
+        let error = chain
+            .resolve(&request(Origin::Cached("solo-leveling".into())))
+            .await
+            .expect_err("no catalog, so nothing resolves");
+        assert!(!format!("{error:#}").contains("Autoswitch"));
     }
 
     #[test]

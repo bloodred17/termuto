@@ -153,6 +153,13 @@ impl App {
         self.playback.provider().unwrap_or("none")
     }
 
+    /// Whether a host with nothing to offer falls through to the next one.
+    /// Shown in the header as `auto`, since it changes which host a title can
+    /// come from and that is otherwise invisible until something fails.
+    pub(crate) fn autoswitch(&self) -> bool {
+        self.playback.autoswitch()
+    }
+
     /// The screen whose contents are on show. The quit prompt, the now-playing
     /// panel, and errors are overlays, so the screen underneath keeps drawing.
     pub(crate) fn display_screen(&self) -> Screen {
@@ -162,7 +169,10 @@ impl App {
                 .last()
                 .copied()
                 .filter(|screen| {
-                    !matches!(screen, Screen::QuitConfirm | Screen::Error | Screen::Playing)
+                    !matches!(
+                        screen,
+                        Screen::QuitConfirm | Screen::Error | Screen::Playing
+                    )
                 })
                 .unwrap_or(Screen::Home),
             screen => screen,
@@ -367,9 +377,12 @@ impl App {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => self.go_back(),
             KeyCode::Char('/') => self.enter_search(),
-            // Takes effect on the next play; nothing already handed to the
+            // Both take effect on the next play; nothing already handed to the
             // player is affected.
             KeyCode::Char('p') => self.playback.cycle_provider(),
+            KeyCode::Char('a') => {
+                self.playback.toggle_autoswitch();
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
@@ -528,9 +541,11 @@ impl App {
                 let Some(anime) = self.cached_detail() else {
                     return;
                 };
-                let request =
-                    self.playback
-                        .request(Origin::Cached(anime.id.clone()), anime.title.clone(), None);
+                let request = self.playback.request(
+                    Origin::Cached(anime.id.clone()),
+                    anime.title.clone(),
+                    None,
+                );
                 self.queue(Action::Play(request));
             }
             // A live movie plays straight away; a series needs an episode first.
@@ -641,15 +656,27 @@ mod tests {
         assert_eq!(app.provider_name(), "zokoanime");
     }
 
-    /// `p` is an ordinary letter, so it has to reach the query rather than
-    /// silently switching hosts while a search is being typed.
     #[tokio::test]
-    async fn p_types_into_a_search_instead_of_switching() {
+    async fn a_toggles_autoswitch_which_starts_on() {
+        let mut app = app().await;
+        assert!(app.autoswitch());
+        press(&mut app, KeyCode::Char('a'));
+        assert!(!app.autoswitch());
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.autoswitch());
+    }
+
+    /// `p` and `a` are ordinary letters, so they have to reach the query rather
+    /// than silently changing how playback resolves while a search is typed.
+    #[tokio::test]
+    async fn provider_keys_type_into_a_search_instead_of_taking_effect() {
         let mut app = app().await;
         press(&mut app, KeyCode::Char('/'));
         press(&mut app, KeyCode::Char('p'));
-        assert_eq!(app.search_input, "p");
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.search_input, "pa");
         assert_eq!(app.provider_name(), "zokoanime");
+        assert!(app.autoswitch());
     }
 
     #[test]

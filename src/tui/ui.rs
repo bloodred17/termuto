@@ -23,14 +23,9 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         .split(frame.area());
 
     frame.render_widget(
-        Paragraph::new(format!(
-            "termuto — anime from the terminal · mode: {} · player: {} · provider: {}",
-            app.mode(),
-            app.player_name(),
-            app.provider_name()
-        ))
-        .block(Block::default().borders(Borders::ALL).title(" termuto "))
-        .alignment(Alignment::Center),
+        Paragraph::new(header_line(app))
+            .block(Block::default().borders(Borders::ALL).title(" termuto "))
+            .alignment(Alignment::Center),
         chunks[0],
     );
 
@@ -63,6 +58,29 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Paragraph::new(help_text(app)).alignment(Alignment::Center),
         chunks[2],
     );
+}
+
+/// The header, carrying the settings that change what a play actually does.
+/// `auto` is highlighted rather than written into the sentence: it is a state
+/// that toggles under the user, not a label, and the colour is what makes a
+/// glance enough to read it.
+fn header_line(app: &App) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!(
+        "termuto — anime from the terminal · mode: {} · player: {} · provider: {}",
+        app.mode(),
+        app.player_name(),
+        app.provider_name()
+    ))];
+    if app.autoswitch() {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            "auto",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_home(frame: &mut Frame, app: &App, area: Rect) {
@@ -258,14 +276,12 @@ fn render_live_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_bottom(indicator),
-            ),
+        Paragraph::new(lines).scroll((scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_bottom(indicator),
+        ),
         area,
     );
 }
@@ -294,12 +310,19 @@ fn live_detail_lines(anime: &LiveAnime, width: usize) -> Vec<Line<'static>> {
         anime.episodes.map(|count| count.to_string()),
     );
     push_fact(&mut facts, "Status", anime.status.clone());
-    push_fact(&mut facts, "Aired", anime.aired.as_ref().and_then(|aired| aired.string.clone()));
+    push_fact(
+        &mut facts,
+        "Aired",
+        anime.aired.as_ref().and_then(|aired| aired.string.clone()),
+    );
     push_fact(&mut facts, "Season", anime.season_label());
     push_fact(
         &mut facts,
         "Broadcast",
-        anime.broadcast.as_ref().and_then(|slot| slot.string.clone()),
+        anime
+            .broadcast
+            .as_ref()
+            .and_then(|slot| slot.string.clone()),
     );
     push_fact(&mut facts, "Duration", anime.duration.clone());
     push_fact(&mut facts, "Rating", anime.rating.clone());
@@ -312,7 +335,11 @@ fn live_detail_lines(anime: &LiveAnime, width: usize) -> Vec<Line<'static>> {
             None => format!("{score:.2}"),
         }),
     );
-    push_fact(&mut facts, "Rank", anime.rank.map(|rank| format!("#{rank}")));
+    push_fact(
+        &mut facts,
+        "Rank",
+        anime.rank.map(|rank| format!("#{rank}")),
+    );
     push_fact(
         &mut facts,
         "Popularity",
@@ -409,14 +436,12 @@ fn render_now_playing(frame: &mut Frame, app: &App, area: Rect) {
     let popup = centered(width, height, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Now playing ")
-                    .border_style(Style::default().fg(Color::Green)),
-            ),
+        Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Now playing ")
+                .border_style(Style::default().fg(Color::Green)),
+        ),
         popup,
     );
 }
@@ -542,17 +567,17 @@ fn help_text(app: &App) -> &'static str {
         return "Loading…";
     }
     match app.screen {
-        Screen::Home => "↑/↓ select • Enter open • / Search • p Provider • q Quit",
+        Screen::Home => "↑/↓ select • Enter open • / Search • p Provider • a Auto • q Quit",
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
-        Screen::SeasonPicker => "↑/↓ or j/k select • Enter open season • p Provider • Esc back",
-        Screen::LiveDetail => "↑/↓ or j/k scroll • Enter play • p Provider • Esc back",
+        Screen::SeasonPicker => "↑/↓ or j/k select • Enter open • p Provider • a Auto • Esc back",
+        Screen::LiveDetail => "↑/↓ or j/k scroll • Enter play • p Provider • a Auto • Esc back",
         Screen::Episodes | Screen::LiveEpisodes | Screen::MovieDetail => {
-            "↑/↓ or j/k select • Enter play • p Provider • Esc back"
+            "↑/↓ or j/k select • Enter play • p Provider • a Auto • Esc back"
         }
         Screen::Playing => "Any key to dismiss",
         Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         Screen::Error => "Any key to dismiss",
-        Screen::Listing => "↑/↓ or j/k select • Enter open • / Search • p Provider • Esc back",
+        Screen::Listing => "↑/↓ select • Enter open • / Search • p Provider • a Auto • Esc back",
     }
 }
 
@@ -655,7 +680,10 @@ fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= budget {
         return text.to_string();
     }
-    text.chars().take(budget.saturating_sub(1)).collect::<String>() + "…"
+    text.chars()
+        .take(budget.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -679,7 +707,61 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{thousands, wrap_text};
+    use super::{App, Color, header_line, thousands, wrap_text};
+    use crate::mode::Mode;
+    use crate::playback::{Playback, TrackPrefs};
+    use crate::source::Source;
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    async fn app() -> App {
+        let source = Source::open(Mode::Cached, "catalog.json")
+            .await
+            .expect("the catalog opens");
+        let playback = Playback::new(
+            source.catalog().cloned(),
+            TrackPrefs::default(),
+            "true".to_string(),
+        )
+        .expect("playback builds");
+        App::new(source, playback)
+    }
+
+    fn header(app: &App) -> String {
+        header_line(app)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    /// The indicator is the only thing that says which way the toggle is set,
+    /// so it has to appear and disappear with it.
+    #[tokio::test]
+    async fn the_auto_indicator_shows_only_while_autoswitch_is_on() {
+        let mut app = app().await;
+        let line = header_line(&app);
+        assert!(header(&app).contains("provider: zokoanime · auto"));
+        // Coloured, so it reads as a state at a glance rather than as prose.
+        let auto = line
+            .spans
+            .iter()
+            .find(|span| span.content == "auto")
+            .expect("the indicator");
+        assert_eq!(auto.style.fg, Some(Color::Green));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        let off = header(&app);
+        assert!(!off.contains("auto"), "{off}");
+        // The host it is pinned to is still named.
+        assert!(off.contains("provider: zokoanime"), "{off}");
+    }
+
+    #[tokio::test]
+    async fn the_header_tracks_the_chosen_host() {
+        let mut app = app().await;
+        app.handle_key(KeyEvent::from(KeyCode::Char('p')));
+        assert!(header(&app).contains("provider: megavid"));
+    }
 
     #[test]
     fn wrapping_breaks_on_words_and_keeps_blank_paragraphs() {
@@ -690,7 +772,10 @@ mod tests {
 
     #[test]
     fn long_words_are_not_lost() {
-        assert_eq!(wrap_text("supercalifragilistic", 5), vec!["supercalifragilistic"]);
+        assert_eq!(
+            wrap_text("supercalifragilistic", 5),
+            vec!["supercalifragilistic"]
+        );
     }
 
     #[test]

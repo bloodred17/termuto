@@ -1,6 +1,9 @@
 use crate::catalog::AnimeKind;
 use crate::mode::{MODE_ENV, Mode, resolve_mode};
-use crate::playback::{Audio, PROVIDER_ENV, Playback, Quality, resolve_player, resolve_prefs};
+use crate::playback::{
+    Audio, PROVIDER_ENV, Playback, Quality, Switch, resolve_autoswitch, resolve_player,
+    resolve_prefs,
+};
 use crate::source::{AnimeDetail, AnimeSummary, SeasonRef, Source};
 use crate::tui;
 use anyhow::{Result, anyhow, bail};
@@ -39,6 +42,11 @@ pub struct Cli {
     /// TERMUTO_PROVIDER or zokoanime). The others stay on as fallbacks.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<String>,
+
+    /// Whether a host with nothing to offer falls through to the next one
+    /// (defaults to TERMUTO_AUTOSWITCH or on)
+    #[arg(long, global = true, value_name = "ON|OFF", value_enum)]
+    pub autoswitch: Option<Switch>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -105,7 +113,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(issue) = source.catalog_issue() {
         eprintln!("warning: continuing without the local catalog — {issue}");
     }
+    let autoswitch = resolve_autoswitch(cli.autoswitch).map_err(|message| anyhow!(message))?;
     let mut playback = Playback::for_source(&source, prefs, resolve_player(cli.player))?;
+    playback.set_autoswitch(autoswitch);
     if let Some(provider) = resolve_provider(cli.provider) {
         playback.prefer_provider(&provider)?;
     }

@@ -26,7 +26,10 @@ use proxy::Proxy;
 use std::time::Duration;
 
 pub use player::{DEFAULT_PLAYER, PLAYER_ENV, Player, resolve_player};
-pub use prefs::{AUDIO_ENV, Audio, QUALITY_ENV, Quality, TrackPrefs, resolve_prefs};
+pub use prefs::{
+    AUDIO_ENV, AUTOSWITCH_ENV, Audio, QUALITY_ENV, Quality, Switch, TrackPrefs, resolve_autoswitch,
+    resolve_prefs,
+};
 pub use provider::{PROVIDER_ENV, ProviderChain, Stream, StreamProvider, StreamRequest};
 
 /// How often [`Playback::wait_for_players`] looks at the player again. Long
@@ -90,6 +93,20 @@ impl Playback {
     /// Chooses `name` as the leading host, failing on an unknown one.
     pub fn prefer_provider(&mut self, name: &str) -> Result<()> {
         self.chain.prefer(name)
+    }
+
+    /// Whether a host that cannot serve a request hands over to the next one.
+    pub fn autoswitch(&self) -> bool {
+        self.chain.autoswitch()
+    }
+
+    pub fn set_autoswitch(&mut self, on: bool) {
+        self.chain.set_autoswitch(on);
+    }
+
+    /// Flips it, returning the new setting so a caller can report it.
+    pub fn toggle_autoswitch(&mut self) -> bool {
+        self.chain.toggle_autoswitch()
     }
 
     /// Whether a stream is playing through the in-process proxy. While this

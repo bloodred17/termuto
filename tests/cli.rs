@@ -16,6 +16,7 @@ fn command() -> Command {
         .env_remove("TERMUTO_CATALOG")
         .env_remove("TERMUTO_PLAYER")
         .env_remove("TERMUTO_AUDIO")
+        .env_remove("TERMUTO_AUTOSWITCH")
         .env_remove("TERMUTO_PROVIDER")
         .env_remove("TERMUTO_QUALITY");
     command
@@ -202,6 +203,38 @@ fn choosing_a_host_leaves_catalog_rows_playing_from_the_catalog() {
         .stdout(predicate::str::contains(
             "media/solo-leveling-season-2/02.mkv",
         ));
+}
+
+/// With the fallbacks held back, the failure has to say so — otherwise it reads
+/// as "no host has this" when the untried one might.
+#[test]
+fn turning_autoswitch_off_holds_the_other_hosts_back_and_says_so() {
+    playable()
+        .args(["--autoswitch", "off", "play", "frieren"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Providers tried: catalog, zokoanime"))
+        .stderr(predicate::str::contains(
+            "Autoswitch is off, so megavid was not tried",
+        ));
+}
+
+#[test]
+fn an_unknown_autoswitch_setting_is_rejected() {
+    cached()
+        .args(["--autoswitch", "maybe", "latest"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("maybe"));
+
+    command()
+        .env("TERMUTO_AUTOSWITCH", "maybe")
+        .args(["--mode", "cached", "--catalog"])
+        .arg(catalog_path())
+        .arg("latest")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TERMUTO_AUTOSWITCH is invalid"));
 }
 
 #[test]
