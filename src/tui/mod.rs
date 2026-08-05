@@ -4,6 +4,7 @@ mod app;
 mod event;
 mod preview;
 mod ui;
+mod view;
 
 use crate::playback::Playback;
 use crate::source::Source;

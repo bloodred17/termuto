@@ -1,5 +1,6 @@
 use super::app::{App, Screen, SearchFocus};
 use super::preview::Preview;
+use super::view::ListView;
 use crate::catalog::Anime;
 use crate::live::model::Named;
 use crate::live::{LiveAnime, LiveEpisode};
@@ -56,8 +57,12 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         render_loading(frame, &label, chunks[1]);
     }
 
+    // Wrapped, so the longer lines use both rows of the footer rather than
+    // losing their tail off the side of a narrow terminal.
     frame.render_widget(
-        Paragraph::new(help_text(app)).alignment(Alignment::Center),
+        Paragraph::new(help_text(app))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         chunks[2],
     );
 }
@@ -91,17 +96,26 @@ fn render_home(frame: &mut Frame, app: &App, area: Rect) {
         .into_iter()
         .map(ListItem::new)
         .collect::<Vec<_>>();
-    render_list(frame, area, "Home", items, app.home_index);
+    render_list(
+        frame,
+        area,
+        "Home",
+        items,
+        app.home_index,
+        Chrome::default(),
+    );
 }
 
 fn render_listing(frame: &mut Frame, app: &App, area: Rect) {
     let title = listing_title(&app.listing_title, &app.listing);
+    let order = app.visible_listing();
     render_list(
         frame,
         area,
         &title,
-        summary_items(&app.listing),
+        or_no_matches(summary_items(&app.listing, &order), app.listing.len()),
         app.list_index,
+        Chrome::of(&app.listing_view, order.len(), app.listing.len()),
     );
 }
 
@@ -116,12 +130,20 @@ fn listing_title(heading: &str, rows: &[AnimeSummary]) -> String {
 }
 
 fn render_season_picker(frame: &mut Frame, app: &App, area: Rect) {
-    let items = app
-        .seasons
+    let order = app.visible_seasons();
+    let items = order
         .iter()
+        .filter_map(|index| app.seasons.get(*index))
         .map(|season| ListItem::new(season.label()))
         .collect::<Vec<_>>();
-    render_list(frame, area, "Seasons", items, app.season_index);
+    render_list(
+        frame,
+        area,
+        "Seasons",
+        or_no_matches(items, app.seasons.len()),
+        app.season_index,
+        Chrome::of(&app.seasons_view, order.len(), app.seasons.len()),
+    );
 }
 
 fn render_search(frame: &mut Frame, app: &App, area: Rect) {
@@ -150,6 +172,7 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         chunks[0],
     );
 
+    let order = app.visible_listing();
     let items = if app.listing.is_empty() {
         let message = match app.search_submitted.as_deref() {
             Some(query) => format!("No titles found for \"{query}\"."),
@@ -157,22 +180,22 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
         };
         vec![ListItem::new(message)]
     } else {
-        summary_items(&app.listing)
+        or_no_matches(summary_items(&app.listing, &order), app.listing.len())
     };
 
     let title = listing_title("Results", &app.listing);
+    let chrome = Chrome::of(&app.listing_view, order.len(), app.listing.len());
     if editing {
         // Nothing is selected while the query has focus.
-        frame.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {title} ")),
-            ),
-            chunks[1],
-        );
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "));
+        if let Some(status) = chrome.status {
+            block = block.title_bottom(status);
+        }
+        frame.render_widget(List::new(items).block(block), chunks[1]);
     } else {
-        render_list(frame, chunks[1], &title, items, app.list_index);
+        render_list(frame, chunks[1], &title, items, app.list_index, chrome);
     }
 }
 
@@ -180,9 +203,10 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
     let Some(anime) = app.cached_detail() else {
         return;
     };
-    let items = anime
-        .episodes
+    let order = app.visible_episodes();
+    let items = order
         .iter()
+        .filter_map(|index| anime.episodes.get(*index))
         .map(|episode| {
             let released = episode
                 .released_at
@@ -198,8 +222,9 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         area,
         &format!("{} — episodes", anime.title),
-        items,
+        or_no_matches(items, anime.episodes.len()),
         app.episode_index,
+        Chrome::of(&app.episodes_view, order.len(), anime.episodes.len()),
     );
 }
 
@@ -219,13 +244,24 @@ fn render_live_episodes(frame: &mut Frame, app: &mut App, area: Rect) {
     let (list_area, side) = split_episode_area(app, area);
 
     let width = list_area.width.saturating_sub(4) as usize;
-    let items = (0..app.live_episode_count())
-        .map(|index| match app.episode(index) {
+    let total = app.live_episode_count();
+    let order = app.visible_episodes();
+    let items = order
+        .iter()
+        .map(|index| match app.episode(*index) {
             Some(episode) => ListItem::new(episode_row(episode, width)),
+            // Numbered from its place in the series, not its place on screen.
             None => ListItem::new(format!("{:>3}  Episode {}", index + 1, index + 1)),
         })
         .collect::<Vec<_>>();
-    render_list(frame, list_area, &title, items, app.episode_index);
+    render_list(
+        frame,
+        list_area,
+        &title,
+        or_no_matches(items, total),
+        app.episode_index,
+        Chrome::of(&app.episodes_view, order.len(), total),
+    );
 
     if let Some(side) = side {
         render_episode_side(frame, app, side);
@@ -693,19 +729,56 @@ fn render_loading(frame: &mut Frame, label: &str, area: Rect) {
     );
 }
 
+/// What sorting and filtering add to a list's frame: a line under the bottom
+/// border saying how the rows are ordered and what is being held back, and a
+/// lit border while the filter is taking keys.
+#[derive(Default)]
+struct Chrome {
+    status: Option<String>,
+    editing: bool,
+}
+
+impl Chrome {
+    fn of(view: &ListView, visible: usize, total: usize) -> Self {
+        Self {
+            status: view.status(visible, total),
+            editing: view.editing(),
+        }
+    }
+}
+
+/// A filter that matches nothing leaves an empty list, which on its own looks
+/// like a screen that failed to load.
+fn or_no_matches(items: Vec<ListItem<'static>>, total: usize) -> Vec<ListItem<'static>> {
+    if items.is_empty() && total > 0 {
+        return vec![ListItem::new(Span::styled(
+            "No rows match this filter.",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+    items
+}
+
 fn render_list(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     items: Vec<ListItem<'_>>,
     selected: usize,
+    chrome: Chrome,
 ) {
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    if let Some(status) = chrome.status {
+        block = block.title_bottom(status);
+    }
+    if chrome.editing {
+        block = block.border_style(Style::default().fg(Color::Cyan));
+    }
+
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {title} ")),
-        )
+        .block(block)
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -718,8 +791,10 @@ fn render_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn summary_items(rows: &[AnimeSummary]) -> Vec<ListItem<'static>> {
-    rows.iter()
+fn summary_items(rows: &[AnimeSummary], order: &[usize]) -> Vec<ListItem<'static>> {
+    order
+        .iter()
+        .filter_map(|index| rows.get(*index))
         .map(|row| match &row.note {
             Some(note) => ListItem::new(vec![
                 Line::from(row.row()),
@@ -737,21 +812,32 @@ fn help_text(app: &App) -> &'static str {
     if app.is_busy() {
         return "Loading…";
     }
+    if app.filtering() {
+        return "Type to filter • Enter keep • Esc clear • ↑/↓ select";
+    }
     match app.screen {
         Screen::Home => "↑/↓ select • Enter open • / Search • p Provider • a Auto • q Quit",
+        Screen::Search if app.search_focus == SearchFocus::Results => {
+            "↑/↓ select • Enter open • f Filter • d Date • n Name • / query • Esc back"
+        }
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
-        Screen::SeasonPicker => "↑/↓ or j/k select • Enter open • p Provider • a Auto • Esc back",
+        Screen::SeasonPicker => {
+            "↑/↓ or j/k select • Enter open • f Filter • d Date • n Name • p Provider • Esc back"
+        }
         Screen::LiveDetail => "↑/↓ or j/k scroll • Enter play • p Provider • a Auto • Esc back",
         Screen::LiveEpisodes => {
-            "↑/↓ or j/k select • Enter play • v Image • s Synopsis • p Provider • Esc back"
+            "↑/↓ or j/k select • Enter play • f Filter • d Date • n Name • v Image • s Synopsis • p Provider • Esc back"
         }
-        Screen::Episodes | Screen::MovieDetail => {
-            "↑/↓ or j/k select • Enter play • p Provider • a Auto • Esc back"
+        Screen::Episodes => {
+            "↑/↓ or j/k select • Enter play • f Filter • d Date • n Name • p Provider • a Auto • Esc back"
         }
+        Screen::MovieDetail => "↑/↓ or j/k select • Enter play • p Provider • a Auto • Esc back",
         Screen::Playing => "Any key to dismiss",
         Screen::QuitConfirm => "y Quit • n Stay • Esc Stay",
         Screen::Error => "Any key to dismiss",
-        Screen::Listing => "↑/↓ select • Enter open • / Search • p Provider • a Auto • Esc back",
+        Screen::Listing => {
+            "↑/↓ select • Enter open • f Filter • d Date • n Name • / Search • p Provider • a Auto • Esc back"
+        }
     }
 }
 
@@ -1062,6 +1148,51 @@ mod tests {
 
     const PREVIEW_PANE: &str = "┌ Preview";
     const SYNOPSIS_PANE: &str = "┌ Synopsis";
+
+    /// The filter bar rides under the list's bottom border, so it stays out of
+    /// the column header and the rows keep the whole box.
+    #[tokio::test]
+    async fn the_filter_bar_says_what_was_typed_and_how_much_it_left() {
+        let mut app = app().await;
+        frieren(&mut app, 4);
+        app.handle_key(KeyEvent::from(KeyCode::Char('f')));
+        for character in "journey".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(character)));
+        }
+
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("filter: journey"), "{screen}");
+        assert!(screen.contains("1/4"), "{screen}");
+        assert!(screen.contains("The Journey's End"), "{screen}");
+        assert!(!screen.contains("It Didn't Have to Be Magic"), "{screen}");
+        // The rows numbered past the fetched list are filtered like any other.
+        assert!(!screen.contains("Episode 3"), "{screen}");
+    }
+
+    /// The still and the synopsis are drawn from the highlighted row, so a sort
+    /// has to carry the selection to wherever its episode ended up.
+    #[tokio::test]
+    async fn sorting_the_episode_picker_keeps_the_selection_on_its_episode() {
+        let mut app = app().await;
+        frieren(&mut app, 4);
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(
+            app.selected_episode().map(|episode| episode.mal_id),
+            Some(2)
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('n')));
+        // The unnamed rows sort under "Episode", ahead of both titled ones.
+        assert_eq!(app.visible_episodes(), vec![2, 3, 1, 0]);
+        assert_eq!(app.episode_index, 2);
+        assert_eq!(
+            app.selected_episode().map(|episode| episode.mal_id),
+            Some(2)
+        );
+
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("sort: name a–z"), "{screen}");
+    }
 
     /// The API pages its episode list, and a still-airing title can report more
     /// episodes than a page returns. The remainder is still selectable.

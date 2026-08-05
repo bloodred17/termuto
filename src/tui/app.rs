@@ -1,8 +1,10 @@
 use super::preview::{self, Preview, Renderer};
+use super::view::{ListView, RowKeys, SortKey};
 use crate::catalog::AnimeKind;
 use crate::live::LiveEpisode;
 use crate::mode::Mode;
 use crate::playback::{Playback, StreamRequest};
+use crate::source::model::EMPTY;
 use crate::source::{AnimeDetail, AnimeSummary, Origin, SeasonRef, Source};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -118,6 +120,12 @@ pub(crate) struct App {
     pub(crate) listing_title: String,
     pub(crate) listing: Vec<AnimeSummary>,
     pub(crate) seasons: Vec<SeasonRef>,
+    /// How each list is sorted and filtered. One per kind of list rather than
+    /// one per screen: the listing and its search results are the same rows,
+    /// and the two episode pickers never show at once.
+    pub(crate) listing_view: ListView,
+    pub(crate) episodes_view: ListView,
+    pub(crate) seasons_view: ListView,
     pub(crate) search_input: String,
     pub(crate) search_focus: SearchFocus,
     pub(crate) search_submitted: Option<String>,
@@ -158,6 +166,9 @@ impl App {
             listing_title: String::new(),
             listing: Vec::new(),
             seasons: Vec::new(),
+            listing_view: ListView::default(),
+            episodes_view: ListView::default(),
+            seasons_view: ListView::default(),
             search_input: String::new(),
             search_focus: SearchFocus::Query,
             search_submitted: None,
@@ -306,6 +317,7 @@ impl App {
             Action::SeasonIndex => {
                 self.seasons = self.source.seasons_index().await?;
                 self.season_index = 0;
+                self.seasons_view = ListView::default();
                 self.enter(Screen::SeasonPicker);
             }
             Action::Season(season) => {
@@ -328,6 +340,7 @@ impl App {
                 self.listing = self.source.search(query, LISTING_LIMIT).await?;
                 self.search_submitted = Some(query.clone());
                 self.list_index = 0;
+                self.listing_view = ListView::default();
                 self.search_focus = if self.listing.is_empty() {
                     SearchFocus::Query
                 } else {
@@ -338,6 +351,7 @@ impl App {
                 let detail = self.source.detail(origin).await?;
                 self.detail_scroll = 0;
                 self.episode_index = 0;
+                self.episodes_view = ListView::default();
                 let screen = match &detail {
                     AnimeDetail::Live(_) => Screen::LiveDetail,
                     AnimeDetail::Cached(anime) => match anime.kind {
@@ -358,6 +372,7 @@ impl App {
                     .await
                     .unwrap_or_default();
                 self.episode_index = 0;
+                self.episodes_view = ListView::default();
                 self.previews.clear();
                 self.enter(Screen::LiveEpisodes);
                 self.request_preview();
@@ -378,10 +393,13 @@ impl App {
         Ok(())
     }
 
+    /// A new list arrives in the order its source chose, with nothing hidden:
+    /// a filter typed against the last screen has no meaning on this one.
     fn show_listing(&mut self, title: &str, rows: Vec<AnimeSummary>) {
         self.listing_title = title.to_string();
         self.listing = rows;
         self.list_index = 0;
+        self.listing_view = ListView::default();
         self.enter(Screen::Listing);
     }
 
@@ -419,8 +437,16 @@ impl App {
                 self.go_back();
                 return true;
             }
-            Screen::Search => return self.handle_search_key(key),
             _ => {}
+        }
+
+        // A filter being typed owns the keyboard, so `q` and the rest stay
+        // ordinary letters until it is accepted or abandoned.
+        if self.filtering() {
+            return self.handle_filter_key(key);
+        }
+        if self.screen == Screen::Search {
+            return self.handle_search_key(key);
         }
 
         match key.code {
@@ -444,6 +470,10 @@ impl App {
             KeyCode::Char('s') if self.screen == Screen::LiveEpisodes => {
                 self.show_synopsis = !self.show_synopsis;
             }
+            // No-ops on a screen without a list, like the toggles above.
+            KeyCode::Char('f') => self.begin_filter(),
+            KeyCode::Char('d') => self.sort_by(SortKey::Date),
+            KeyCode::Char('n') => self.sort_by(SortKey::Name),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
@@ -502,6 +532,11 @@ impl App {
             (SearchFocus::Results, KeyCode::Char('/')) => {
                 self.search_focus = SearchFocus::Query;
             }
+            // The query is what the API was asked; these narrow and reorder
+            // what came back, without spending another request.
+            (SearchFocus::Results, KeyCode::Char('f')) => self.begin_filter(),
+            (SearchFocus::Results, KeyCode::Char('d')) => self.sort_by(SortKey::Date),
+            (SearchFocus::Results, KeyCode::Char('n')) => self.sort_by(SortKey::Name),
             (SearchFocus::Results, KeyCode::Up | KeyCode::Char('k')) => {
                 if self.list_index == 0 {
                     self.search_focus = SearchFocus::Query;
@@ -522,8 +557,192 @@ impl App {
         self.search_submitted = None;
         self.listing.clear();
         self.list_index = 0;
+        self.listing_view = ListView::default();
         self.search_focus = SearchFocus::Query;
         self.enter(Screen::Search);
+    }
+
+    /// Whether a filter is being typed, which changes both what the keys mean
+    /// and what the foot of the screen offers.
+    pub(crate) fn filtering(&self) -> bool {
+        self.active_view().is_some_and(ListView::editing)
+    }
+
+    /// Typing narrows the list on every keystroke: the rows are already in
+    /// hand, so there is nothing to wait for and no reason to make it a
+    /// submitted query like the API search above.
+    fn handle_filter_key(&mut self, key: KeyEvent) -> bool {
+        let selected = self.selected_row();
+        match key.code {
+            // Esc abandons the filter; Enter keeps it and returns to the list.
+            KeyCode::Esc => self.with_view(|view| view.cancel_filter()),
+            KeyCode::Enter => {
+                self.with_view(|view| view.accept_filter());
+                return true;
+            }
+            KeyCode::Backspace => self.with_view(|view| view.pop_filter()),
+            KeyCode::Char(character) => self.with_view(|view| view.push_filter(character)),
+            // The list stays live under the filter bar, so it can be walked
+            // without accepting the filter first.
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(10),
+            _ => {}
+        }
+        // Whatever the filter now leaves may not hold the selected row, or may
+        // hold it somewhere else.
+        self.follow_selection(selected);
+        true
+    }
+
+    fn begin_filter(&mut self) {
+        self.with_view(|view| view.begin_filter());
+    }
+
+    fn sort_by(&mut self, key: SortKey) {
+        let selected = self.selected_row();
+        self.with_view(|view| view.sort_by(key));
+        self.follow_selection(selected);
+    }
+
+    fn with_view(&mut self, edit: impl FnOnce(&mut ListView)) {
+        if let Some(view) = self.active_view_mut() {
+            edit(view);
+        }
+    }
+
+    /// The list the sort and filter keys act on, for the screens that have one.
+    /// The search screen only counts once its results have focus — until then
+    /// every letter belongs to the query.
+    fn active_view(&self) -> Option<&ListView> {
+        match self.screen {
+            Screen::Listing => Some(&self.listing_view),
+            Screen::Search if self.search_focus == SearchFocus::Results => Some(&self.listing_view),
+            Screen::Episodes | Screen::LiveEpisodes => Some(&self.episodes_view),
+            Screen::SeasonPicker => Some(&self.seasons_view),
+            _ => None,
+        }
+    }
+
+    fn active_view_mut(&mut self) -> Option<&mut ListView> {
+        match self.screen {
+            Screen::Listing => Some(&mut self.listing_view),
+            Screen::Search if self.search_focus == SearchFocus::Results => {
+                Some(&mut self.listing_view)
+            }
+            Screen::Episodes | Screen::LiveEpisodes => Some(&mut self.episodes_view),
+            Screen::SeasonPicker => Some(&mut self.seasons_view),
+            _ => None,
+        }
+    }
+
+    /// The rows the screen shows, as positions into the data behind it.
+    fn visible(&self) -> Option<Vec<usize>> {
+        match self.screen {
+            Screen::Listing | Screen::Search => Some(self.visible_listing()),
+            Screen::Episodes | Screen::LiveEpisodes => Some(self.visible_episodes()),
+            Screen::SeasonPicker => Some(self.visible_seasons()),
+            _ => None,
+        }
+    }
+
+    fn selection_mut(&mut self) -> Option<&mut usize> {
+        match self.screen {
+            Screen::Listing | Screen::Search => Some(&mut self.list_index),
+            Screen::Episodes | Screen::LiveEpisodes => Some(&mut self.episode_index),
+            Screen::SeasonPicker => Some(&mut self.season_index),
+            _ => None,
+        }
+    }
+
+    /// Which row of the underlying data the highlight is on, as opposed to
+    /// which line of the screen it sits on.
+    fn selected_row(&self) -> Option<usize> {
+        let index = match self.screen {
+            Screen::Listing | Screen::Search => self.list_index,
+            Screen::Episodes | Screen::LiveEpisodes => self.episode_index,
+            Screen::SeasonPicker => self.season_index,
+            _ => return None,
+        };
+        self.visible()?.get(index).copied()
+    }
+
+    /// Puts the highlight back on `row` wherever the new order moved it. A
+    /// sort should reorder the list under the selection, not send it elsewhere;
+    /// a filter that hides the selected row falls back to the top.
+    fn follow_selection(&mut self, row: Option<usize>) {
+        let Some(order) = self.visible() else {
+            return;
+        };
+        let position = row
+            .and_then(|row| order.iter().position(|index| *index == row))
+            .unwrap_or(0)
+            .min(order.len().saturating_sub(1));
+        if let Some(selection) = self.selection_mut() {
+            *selection = position;
+        }
+        if self.screen == Screen::LiveEpisodes {
+            self.request_preview();
+        }
+    }
+
+    pub(crate) fn visible_listing(&self) -> Vec<usize> {
+        self.listing_view.order(&self.listing_keys())
+    }
+
+    pub(crate) fn visible_episodes(&self) -> Vec<usize> {
+        self.episodes_view.order(&self.episode_keys())
+    }
+
+    pub(crate) fn visible_seasons(&self) -> Vec<usize> {
+        self.seasons_view.order(&self.season_keys())
+    }
+
+    fn listing_keys(&self) -> Vec<RowKeys> {
+        self.listing
+            .iter()
+            .map(|row| RowKeys::new(row.title.clone(), sortable_date(&row.released)))
+            .collect()
+    }
+
+    /// Which picker is on screen follows from which kind of title was loaded,
+    /// so the keys are built from the detail rather than from the screen — the
+    /// overlays draw the picker underneath themselves.
+    fn episode_keys(&self) -> Vec<RowKeys> {
+        if let Some(anime) = self.cached_detail() {
+            return anime
+                .episodes
+                .iter()
+                .map(|episode| {
+                    RowKeys::new(
+                        episode.title.clone(),
+                        episode
+                            .released_at
+                            .map(|date| date.format("%Y-%m-%d").to_string()),
+                    )
+                })
+                .collect();
+        }
+        (0..self.live_episode_count())
+            .map(|index| match self.episode(index) {
+                Some(episode) => RowKeys::new(episode.display_title(), episode.aired_label()),
+                // The rows the fetched list did not reach know only their number.
+                None => RowKeys::new(format!("Episode {}", index + 1), None),
+            })
+            .collect()
+    }
+
+    fn season_keys(&self) -> Vec<RowKeys> {
+        self.seasons
+            .iter()
+            .map(|season| {
+                RowKeys::new(
+                    season.label(),
+                    Some(format!("{:04}-{:02}", season.year, season_month(season))),
+                )
+            })
+            .collect()
     }
 
     fn move_selection(&mut self, direction: isize) {
@@ -532,20 +751,22 @@ impl App {
                 let count = self.home_entries().len();
                 move_index(&mut self.home_index, count, direction);
             }
+            // Movement is through what the list shows, so a filtered list steps
+            // between its matches rather than over the rows in between.
             Screen::Listing | Screen::Search => {
-                let count = self.listing.len();
+                let count = self.visible_listing().len();
                 move_index(&mut self.list_index, count, direction);
             }
             Screen::SeasonPicker => {
-                let count = self.seasons.len();
+                let count = self.visible_seasons().len();
                 move_index(&mut self.season_index, count, direction);
             }
             Screen::Episodes => {
-                let count = self.cached_detail().map_or(0, |anime| anime.episodes.len());
+                let count = self.visible_episodes().len();
                 move_index(&mut self.episode_index, count, direction);
             }
             Screen::LiveEpisodes => {
-                let count = self.live_episode_count();
+                let count = self.visible_episodes().len();
                 move_index(&mut self.episode_index, count, direction);
                 self.request_preview();
             }
@@ -574,22 +795,35 @@ impl App {
                     HomeChoice::Quit => self.request_quit(),
                 }
             }
+            // Every screen here opens the row the highlight is on, which after
+            // a sort or a filter is not the row at that position in the data.
             Screen::Listing | Screen::Search => {
-                if let Some(row) = self.listing.get(self.list_index) {
-                    self.queue(Action::Detail(row.origin.clone()));
+                let origin = self
+                    .selected_row()
+                    .and_then(|row| self.listing.get(row))
+                    .map(|row| row.origin.clone());
+                if let Some(origin) = origin {
+                    self.queue(Action::Detail(origin));
                 }
             }
             Screen::SeasonPicker => {
-                if let Some(season) = self.seasons.get(self.season_index).cloned() {
+                let season = self
+                    .selected_row()
+                    .and_then(|row| self.seasons.get(row))
+                    .cloned();
+                if let Some(season) = season {
                     self.queue(Action::Season(season));
                 }
             }
             // A catalog series plays the highlighted episode; a movie has none.
             Screen::Episodes => {
+                let Some(row) = self.selected_row() else {
+                    return;
+                };
                 let Some(anime) = self.cached_detail() else {
                     return;
                 };
-                let Some(episode) = anime.episodes.get(self.episode_index) else {
+                let Some(episode) = anime.episodes.get(row) else {
                     return;
                 };
                 let request = self.playback.request(
@@ -627,10 +861,13 @@ impl App {
                 }
             }
             Screen::LiveEpisodes => {
+                let Some(row) = self.selected_row() else {
+                    return;
+                };
                 let Some(anime) = self.live_detail() else {
                     return;
                 };
-                let number = self.episode_number(self.episode_index);
+                let number = self.episode_number(row);
                 let request = self.playback.request(
                     Origin::Live(anime.mal_id),
                     anime.display_title().to_string(),
@@ -658,8 +895,10 @@ impl App {
         self.episodes.get(index)
     }
 
+    /// The episode the highlight is on, looked up through the view so the still
+    /// and the synopsis beside a sorted list belong to the row they sit next to.
     pub(crate) fn selected_episode(&self) -> Option<&LiveEpisode> {
-        self.episode(self.episode_index)
+        self.episode(self.visible_episodes().get(self.episode_index).copied()?)
     }
 
     /// What to ask the provider for. The API numbers episodes itself, and a
@@ -770,6 +1009,26 @@ impl App {
     }
 }
 
+/// The released column as something the date sort can compare. Sources write
+/// the dash when they have nothing, and a row with nothing sorts last rather
+/// than under a literal `—`.
+fn sortable_date(released: &str) -> Option<String> {
+    let released = released.trim();
+    (!released.is_empty() && released != EMPTY).then(|| released.to_string())
+}
+
+/// Where a season falls in its year. `/seasons` names them, and names put fall
+/// before winter, which is not what sorting by date is being asked for.
+fn season_month(season: &SeasonRef) -> u32 {
+    match season.season.trim().to_lowercase().as_str() {
+        "winter" => 1,
+        "spring" => 4,
+        "summer" => 7,
+        "fall" | "autumn" => 10,
+        _ => 0,
+    }
+}
+
 fn move_index(index: &mut usize, count: usize, direction: isize) {
     if count == 0 {
         *index = 0;
@@ -782,10 +1041,10 @@ fn move_index(index: &mut usize, count: usize, direction: isize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Renderer, move_index};
+    use super::{Action, App, Origin, Renderer, Screen, move_index};
     use crate::mode::Mode;
     use crate::playback::{Playback, TrackPrefs};
-    use crate::source::Source;
+    use crate::source::{AnimeSummary, Source};
     use crossterm::event::{KeyCode, KeyEvent};
 
     /// Built from the repo's own catalog in cached mode, so nothing here needs
@@ -840,6 +1099,159 @@ mod tests {
         assert_eq!(app.search_input, "pa");
         assert_eq!(app.provider_name(), "zokoanime");
         assert!(app.autoswitch());
+    }
+
+    fn summary(mal_id: u32, title: &str, released: &str) -> AnimeSummary {
+        AnimeSummary {
+            origin: Origin::Live(mal_id),
+            title: title.to_string(),
+            kind: "TV".into(),
+            status: "Finished".into(),
+            score: None,
+            episodes: None,
+            released: released.to_string(),
+            note: None,
+        }
+    }
+
+    /// A listing as a source hands one over: unsorted, and with one row the
+    /// source has no date for.
+    fn listing(app: &mut App) {
+        app.listing = vec![
+            summary(1, "Cowboy Bebop", "1998-04-03"),
+            summary(2, "attack on titan", "2013-04-07"),
+            summary(3, "Bocchi the Rock!", "—"),
+        ];
+        app.list_index = 0;
+        app.screen = Screen::Listing;
+    }
+
+    fn titles(app: &App) -> Vec<String> {
+        app.visible_listing()
+            .iter()
+            .map(|index| app.listing[*index].title.clone())
+            .collect()
+    }
+
+    fn selected_title(app: &App) -> String {
+        titles(app)[app.list_index].clone()
+    }
+
+    #[tokio::test]
+    async fn n_orders_a_listing_by_name_and_d_by_date() {
+        let mut app = app().await;
+        listing(&mut app);
+        assert_eq!(titles(&app)[0], "Cowboy Bebop");
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(
+            titles(&app),
+            ["attack on titan", "Bocchi the Rock!", "Cowboy Bebop"]
+        );
+
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(
+            titles(&app),
+            ["attack on titan", "Cowboy Bebop", "Bocchi the Rock!"]
+        );
+        // The same key again is the only way to ask for oldest first.
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(
+            titles(&app),
+            ["Cowboy Bebop", "attack on titan", "Bocchi the Rock!"]
+        );
+    }
+
+    /// Sorting rearranges the list under the highlight rather than moving the
+    /// highlight, so Enter still opens what it was pointing at.
+    #[tokio::test]
+    async fn the_highlighted_title_survives_a_sort_and_is_the_one_opened() {
+        let mut app = app().await;
+        listing(&mut app);
+        assert_eq!(selected_title(&app), "Cowboy Bebop");
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.list_index, 2);
+        assert_eq!(selected_title(&app), "Cowboy Bebop");
+
+        press(&mut app, KeyCode::Enter);
+        match app.take_pending() {
+            Some(Action::Detail(Origin::Live(mal_id))) => assert_eq!(mal_id, 1),
+            other => panic!("expected the Cowboy Bebop detail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn f_narrows_the_listing_as_it_is_typed_and_esc_puts_it_back() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('B'));
+        // Case folds both ways, and the match is anywhere in the title.
+        assert_eq!(titles(&app), ["Cowboy Bebop", "Bocchi the Rock!"]);
+
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(titles(&app), ["Bocchi the Rock!"]);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(titles(&app).len(), 2);
+
+        // The first Esc abandons the filter; only the second leaves the screen.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(titles(&app).len(), 3);
+        assert_eq!(app.screen, Screen::Listing);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    /// The filter is a text field, so the letters bound to actions elsewhere
+    /// have to reach it instead of quitting or changing how playback resolves.
+    #[tokio::test]
+    async fn a_filter_being_typed_takes_the_keys_bound_to_actions() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('f'));
+        for key in ['a', 'q', 'p', 'n', 'd'] {
+            assert!(app.handle_key(KeyEvent::from(KeyCode::Char(key))));
+        }
+        assert_eq!(app.screen, Screen::Listing);
+        assert!(app.autoswitch());
+        assert_eq!(app.provider_name(), "zokoanime");
+        assert!(titles(&app).is_empty());
+
+        // Enter keeps the filter and hands the keys back.
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.filtering());
+        assert!(titles(&app).is_empty());
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.screen, Screen::QuitConfirm);
+    }
+
+    /// A filter that hides everything must not leave Enter pointing at a row.
+    #[tokio::test]
+    async fn nothing_opens_while_the_filter_matches_nothing() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.take_pending().is_none());
+    }
+
+    /// A listing filtered down to one title has no bearing on the next one.
+    #[tokio::test]
+    async fn a_new_listing_arrives_unfiltered() {
+        let mut app = app().await;
+        listing(&mut app);
+        press(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('n'));
+
+        app.show_listing("Airing now", vec![summary(4, "Frieren", "2023-09-29")]);
+        assert!(!app.filtering());
+        assert_eq!(titles(&app), ["Frieren"]);
     }
 
     #[test]
