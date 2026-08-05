@@ -4,4 +4,4 @@ pub mod client;
 pub mod model;
 
 pub use client::{BASE_URL_ENV, DEFAULT_BASE_URL, LiveClient};
-pub use model::{LiveAnime, Recommendation, SeasonYear};
+pub use model::{LiveAnime, LiveEpisode, Recommendation, SeasonYear};

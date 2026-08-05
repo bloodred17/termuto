@@ -9,6 +9,9 @@ pub(crate) async fn run(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        // Stills are fetched in the background, so each frame picks up whichever
+        // ones landed while the last one was on screen.
+        app.collect_previews();
         terminal.draw(|frame| ui::render(frame, app))?;
 
         // A queued action runs only after the loading frame above is on screen,

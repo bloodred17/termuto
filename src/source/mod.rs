@@ -8,7 +8,7 @@
 pub mod model;
 
 use crate::catalog::CatalogRepository;
-use crate::live::{LiveClient, SeasonYear};
+use crate::live::{LiveClient, LiveEpisode, SeasonYear};
 use crate::mode::{MODE_ENV, Mode};
 use anyhow::{Error, Result, bail};
 use std::collections::HashSet;
@@ -188,6 +188,18 @@ impl Source {
                 Ok(AnimeDetail::Live(Box::new(live.anime_full(*id).await?)))
             }
         }
+    }
+
+    /// The episode list behind a live title. API only.
+    pub async fn live_episodes(&self, id: u32, limit: usize) -> Result<Vec<LiveEpisode>> {
+        let live = self.require_live("Episode details")?;
+        live.anime_episodes(id, limit).await
+    }
+
+    /// The API client, when the mode has one. The TUI needs it to fetch episode
+    /// stills, which are plain URLs rather than an API path.
+    pub fn live(&self) -> Option<&LiveClient> {
+        self.live.as_ref()
     }
 
     fn require_live(&self, what: &str) -> Result<&LiveClient> {

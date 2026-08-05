@@ -107,6 +107,8 @@ pub struct LiveAnime {
     pub streaming: Vec<Link>,
     #[serde(default)]
     pub external: Vec<Link>,
+    #[serde(default)]
+    pub images: Option<Images>,
 }
 
 impl LiveAnime {
@@ -133,6 +135,108 @@ impl LiveAnime {
             (None, None) => None,
         }
     }
+
+    /// The poster, used as the preview for episodes the API has no still for.
+    pub fn image_url(&self) -> Option<&str> {
+        self.images.as_ref().and_then(Images::url)
+    }
+}
+
+/// One entry of `/anime/{id}/episodes`. Unlike the count on [`LiveAnime`], this
+/// carries the per-episode title, air date, score, still, and synopsis.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LiveEpisode {
+    /// The episode number, not a catalogue id: episode 3 of a title is `3`.
+    pub mal_id: u32,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub title_japanese: Option<String>,
+    #[serde(default)]
+    pub title_romanji: Option<String>,
+    /// Runtime in seconds.
+    #[serde(default)]
+    pub duration: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_date")]
+    pub aired: Option<DateTime<Utc>>,
+    /// Out of 5, unlike the title score, which is out of 10.
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub filler: bool,
+    #[serde(default)]
+    pub recap: bool,
+    #[serde(default)]
+    pub synopsis: Option<String>,
+    #[serde(default)]
+    pub images: Option<Images>,
+}
+
+impl LiveEpisode {
+    /// The episode title, falling back to its number when the API has none —
+    /// unaired episodes are listed before they are named.
+    pub fn display_title(&self) -> String {
+        let title = self.title.trim();
+        if title.is_empty() {
+            format!("Episode {}", self.mal_id)
+        } else {
+            title.to_string()
+        }
+    }
+
+    pub fn aired_label(&self) -> Option<String> {
+        self.aired.map(|date| date.format("%Y-%m-%d").to_string())
+    }
+
+    pub fn score_label(&self) -> Option<String> {
+        self.score.map(|score| format!("{score:.2}"))
+    }
+
+    pub fn image_url(&self) -> Option<&str> {
+        self.images.as_ref().and_then(Images::url)
+    }
+
+    /// `24m`, or `1h 52m` for a feature-length entry.
+    pub fn duration_label(&self) -> Option<String> {
+        let seconds = self.duration.filter(|seconds| *seconds > 0)?;
+        let minutes = seconds / 60;
+        Some(match (minutes / 60, minutes % 60) {
+            (0, minutes) => format!("{minutes}m"),
+            (hours, minutes) => format!("{hours}h {minutes:02}m"),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Images {
+    #[serde(default)]
+    pub jpg: Option<ImageUrls>,
+}
+
+impl Images {
+    /// The largest still the API offers. Terminal previews are small, but the
+    /// larger source survives downscaling better than a thumbnail does.
+    fn url(&self) -> Option<&str> {
+        let jpg = self.jpg.as_ref()?;
+        jpg.large_image_url
+            .as_deref()
+            .or(jpg.image_url.as_deref())
+            .or(jpg.small_image_url.as_deref())
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ImageUrls {
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub small_image_url: Option<String>,
+    #[serde(default)]
+    pub large_image_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

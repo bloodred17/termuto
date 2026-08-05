@@ -1,13 +1,29 @@
+use super::preview::{self, Preview};
 use crate::catalog::AnimeKind;
+use crate::live::LiveEpisode;
 use crate::mode::Mode;
 use crate::playback::{Playback, StreamRequest};
 use crate::source::{AnimeDetail, AnimeSummary, Origin, SeasonRef, Source};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use image::DynamicImage;
+use ratatui_image::picker::Picker;
+use std::collections::HashMap;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// How many rows a listing screen requests. Deliberately modest: every live
 /// screen is one or two API pages.
 const LISTING_LIMIT: usize = 50;
+
+/// The episode list is paged like any other, and a long-running title has more
+/// episodes than anyone scrolls. Whatever the fetch does not reach still gets a
+/// numbered, playable row from the title's own episode count.
+const EPISODE_LIMIT: usize = 200;
+
+/// How many stills to hold before dropping the ones not in use. A decoded still
+/// and its encoded form cost a megabyte or so each, and a long-running title has
+/// hundreds of episodes to scroll past.
+const PREVIEW_CACHE: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Screen {
@@ -53,6 +69,8 @@ pub(crate) enum Action {
     Ongoing,
     Search(String),
     Detail(Origin),
+    /// The episode list of a live title, fetched when its picker is opened.
+    Episodes(u32),
     /// Resolving a stream can take as long as a listing, so it queues like one.
     Play(StreamRequest),
 }
@@ -69,6 +87,7 @@ impl Action {
             Self::Ongoing => "Loading airing titles…".to_string(),
             Self::Search(query) => format!("Searching for \"{query}\"…"),
             Self::Detail(_) => "Loading details…".to_string(),
+            Self::Episodes(_) => "Loading episodes…".to_string(),
             Self::Play(request) => format!("Resolving {}…", request.label()),
         }
     }
@@ -105,6 +124,18 @@ pub(crate) struct App {
     pub(crate) search_submitted: Option<String>,
     pub(crate) detail: Option<AnimeDetail>,
     pub(crate) detail_scroll: u16,
+    /// The episode list of the live title on screen, when the API had one.
+    pub(crate) episodes: Vec<LiveEpisode>,
+    /// Whether the still and the synopsis panes are shown; `v` and `s` toggle
+    /// them, and both start on.
+    pub(crate) show_preview: bool,
+    pub(crate) show_synopsis: bool,
+    /// Stills by URL, so scrolling back over an episode redraws immediately.
+    previews: HashMap<String, Preview>,
+    preview_tx: UnboundedSender<(String, Option<Box<DynamicImage>>)>,
+    preview_rx: UnboundedReceiver<(String, Option<Box<DynamicImage>>)>,
+    /// What the terminal answered when asked how it draws images.
+    picker: Picker,
     pub(crate) error: Option<String>,
     /// What the last successful play handed to the player, shown on
     /// [`Screen::Playing`].
@@ -114,7 +145,8 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(source: Source, playback: Playback) -> Self {
+    pub(crate) fn new(source: Source, playback: Playback, picker: Picker) -> Self {
+        let (preview_tx, preview_rx) = unbounded_channel();
         Self {
             source,
             playback,
@@ -132,6 +164,13 @@ impl App {
             search_submitted: None,
             detail: None,
             detail_scroll: 0,
+            episodes: Vec::new(),
+            show_preview: true,
+            show_synopsis: true,
+            previews: HashMap::new(),
+            preview_tx,
+            preview_rx,
+            picker,
             error: None,
             now_playing: None,
             pending: None,
@@ -310,6 +349,20 @@ impl App {
                 self.detail = Some(detail);
                 self.enter(screen);
             }
+            // A failed episode list is not worth an error overlay: the title
+            // already reports how many episodes it has, and the picker falls
+            // back to numbering them out, which is what it did before.
+            Action::Episodes(id) => {
+                self.episodes = self
+                    .source
+                    .live_episodes(*id, EPISODE_LIMIT)
+                    .await
+                    .unwrap_or_default();
+                self.episode_index = 0;
+                self.previews.clear();
+                self.enter(Screen::LiveEpisodes);
+                self.request_preview();
+            }
             Action::Play(request) => {
                 let label = request.label();
                 let stream = self.playback.play(request.clone()).await?;
@@ -382,6 +435,15 @@ impl App {
             KeyCode::Char('p') => self.playback.cycle_provider(),
             KeyCode::Char('a') => {
                 self.playback.toggle_autoswitch();
+            }
+            // Only the episode picker has panes to hide, so elsewhere these are
+            // ordinary letters with nothing to do.
+            KeyCode::Char('v') if self.screen == Screen::LiveEpisodes => {
+                self.show_preview = !self.show_preview;
+                self.request_preview();
+            }
+            KeyCode::Char('s') if self.screen == Screen::LiveEpisodes => {
+                self.show_synopsis = !self.show_synopsis;
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -486,6 +548,7 @@ impl App {
             Screen::LiveEpisodes => {
                 let count = self.live_episode_count();
                 move_index(&mut self.episode_index, count, direction);
+                self.request_preview();
             }
             Screen::LiveDetail => {
                 self.detail_scroll = if direction < 0 {
@@ -561,18 +624,18 @@ impl App {
                     );
                     self.queue(Action::Play(request));
                 } else {
-                    self.episode_index = 0;
-                    self.enter(Screen::LiveEpisodes);
+                    self.queue(Action::Episodes(anime.mal_id));
                 }
             }
             Screen::LiveEpisodes => {
                 let Some(anime) = self.live_detail() else {
                     return;
                 };
+                let number = self.episode_number(self.episode_index);
                 let request = self.playback.request(
                     Origin::Live(anime.mal_id),
                     anime.display_title().to_string(),
-                    Some(self.episode_index as u32 + 1),
+                    Some(number),
                 );
                 self.queue(Action::Play(request));
             }
@@ -580,11 +643,111 @@ impl App {
         }
     }
 
-    /// The API reports how many episodes a title has rather than listing them,
-    /// so the picker counts them out. An unknown count means one playable part.
+    /// How many rows the picker shows. `/anime/{id}/episodes` is the better
+    /// answer, but it is paged and can trail a still-airing title, so the count
+    /// the title itself reports still sets the floor — every episode stays
+    /// playable even when the list does not reach it.
     pub(crate) fn live_episode_count(&self) -> usize {
-        self.live_detail()
-            .map_or(0, |anime| anime.episodes.unwrap_or(1).max(1) as usize)
+        let reported = self
+            .live_detail()
+            .map_or(0, |anime| anime.episodes.unwrap_or(1).max(1) as usize);
+        reported.max(self.episodes.len())
+    }
+
+    /// The episode at `index`, for the rows the fetched list covers.
+    pub(crate) fn episode(&self, index: usize) -> Option<&LiveEpisode> {
+        self.episodes.get(index)
+    }
+
+    pub(crate) fn selected_episode(&self) -> Option<&LiveEpisode> {
+        self.episode(self.episode_index)
+    }
+
+    /// What to ask the provider for. The API numbers episodes itself, and a
+    /// title whose list starts at 0 or skips a special would otherwise play the
+    /// wrong part; rows past the fetched list fall back to their position.
+    fn episode_number(&self, index: usize) -> u32 {
+        self.episode(index)
+            .map(|episode| episode.mal_id)
+            .unwrap_or(index as u32 + 1)
+    }
+
+    /// How stills are being drawn, named in the preview pane so a fallback to
+    /// half-blocks is visible rather than just looking bad.
+    pub(crate) fn preview_protocol(&self) -> &'static str {
+        preview::protocol_name(self.picker.protocol_type())
+    }
+
+    /// The still for the selected episode, once it has arrived.
+    pub(crate) fn selected_preview(&self) -> Option<&Preview> {
+        self.previews.get(self.preview_url()?.as_str())
+    }
+
+    /// Drawing advances the protocol's own state — it resizes and re-encodes
+    /// when the pane it is given changes — so the renderer needs it by value.
+    pub(crate) fn selected_preview_mut(&mut self) -> Option<&mut Preview> {
+        let url = self.preview_url()?;
+        self.previews.get_mut(url.as_str())
+    }
+
+    /// The still to show: the episode's own, or the title's poster for the
+    /// episodes — and the trailing numbered rows — the API has no still for.
+    fn preview_url(&self) -> Option<String> {
+        let episode = self.selected_episode().and_then(LiveEpisode::image_url);
+        episode
+            .or_else(|| self.live_detail().and_then(|anime| anime.image_url()))
+            .map(str::to_string)
+    }
+
+    /// Starts fetching the selected still if it is not already in hand. The
+    /// work runs on its own task so moving through the list never blocks on it.
+    fn request_preview(&mut self) {
+        if !self.show_preview {
+            return;
+        }
+        let Some(url) = self.preview_url() else {
+            return;
+        };
+        if self.previews.contains_key(&url) {
+            return;
+        }
+        let Some(client) = self.source.live().cloned() else {
+            return;
+        };
+
+        self.forget_unused_previews();
+        self.previews.insert(url.clone(), Preview::Pending);
+        let sender = self.preview_tx.clone();
+        tokio::spawn(async move {
+            let decoded = preview::fetch(&client, &url).await.map(Box::new);
+            let _ = sender.send((url, decoded));
+        });
+    }
+
+    /// Drops everything but the still on screen once the cache has grown past
+    /// what scrolling back is likely to want.
+    fn forget_unused_previews(&mut self) {
+        if self.previews.len() < PREVIEW_CACHE {
+            return;
+        }
+        let showing = self.preview_url();
+        self.previews
+            .retain(|url, _| Some(url.as_str()) == showing.as_deref());
+    }
+
+    /// Takes whatever stills finished since the last frame. Called by the event
+    /// loop, which redraws on its own timer, so a late arrival simply appears.
+    ///
+    /// The protocol is built here rather than on the fetching task: it holds
+    /// terminal state, and only this thread draws.
+    pub(crate) fn collect_previews(&mut self) {
+        while let Ok((url, decoded)) = self.preview_rx.try_recv() {
+            let entry = match decoded {
+                Some(image) => Preview::Ready(Box::new(self.picker.new_resize_protocol(*image))),
+                None => Preview::Missing,
+            };
+            self.previews.insert(url, entry);
+        }
     }
 
     pub(crate) fn cached_detail(&self) -> Option<&crate::catalog::Anime> {
@@ -625,6 +788,7 @@ mod tests {
     use crate::playback::{Playback, TrackPrefs};
     use crate::source::Source;
     use crossterm::event::{KeyCode, KeyEvent};
+    use ratatui_image::picker::Picker;
 
     /// Built from the repo's own catalog in cached mode, so nothing here needs
     /// the network.
@@ -638,7 +802,8 @@ mod tests {
             "true".to_string(),
         )
         .expect("playback builds");
-        App::new(source, playback)
+        // Nothing here queries a terminal, so the fallback renderer stands in.
+        App::new(source, playback, Picker::halfblocks())
     }
 
     fn press(app: &mut App, code: KeyCode) {

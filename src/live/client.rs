@@ -1,4 +1,4 @@
-use super::model::{ApiError, Envelope, LiveAnime, Page, Recommendation, SeasonYear};
+use super::model::{ApiError, Envelope, LiveAnime, LiveEpisode, Page, Recommendation, SeasonYear};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use std::env;
@@ -99,6 +99,31 @@ impl LiveClient {
     pub async fn anime_full(&self, id: u32) -> Result<LiveAnime> {
         let envelope: Envelope<LiveAnime> = self.get(&format!("anime/{id}/full"), &[]).await?;
         Ok(envelope.data)
+    }
+
+    /// `GET /anime/{id}/episodes` — the episode list, with per-episode titles,
+    /// air dates, scores, stills, and synopses.
+    pub async fn anime_episodes(&self, id: u32, limit: usize) -> Result<Vec<LiveEpisode>> {
+        self.collect(&format!("anime/{id}/episodes"), &[], limit)
+            .await
+    }
+
+    /// Fetches an arbitrary URL as bytes. Episode stills are served from the
+    /// streaming sites' own CDNs, so this deliberately does not join `base_url`.
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("Could not reach {url}"))?
+            .error_for_status()
+            .with_context(|| format!("{url} could not be fetched"))?;
+        Ok(response
+            .bytes()
+            .await
+            .with_context(|| format!("Could not read the response from {url}"))?
+            .to_vec())
     }
 
     /// Requests successive pages until `limit` items are gathered or the API

@@ -2,6 +2,7 @@
 
 mod app;
 mod event;
+mod preview;
 mod ui;
 
 use crate::playback::Playback;
@@ -14,9 +15,15 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Stdout};
 
+pub use preview::IMAGE_PROTOCOL_ENV;
+
 pub async fn run(source: Source, playback: Playback) -> Result<()> {
     let mut terminal = TerminalGuard::new()?;
-    let mut app = app::App::new(source, playback);
+    // The terminal is asked what it can draw and how big a cell is. This writes
+    // to and reads from the terminal directly, so it has to happen after the
+    // alternate screen is up and before the event loop starts reading keys.
+    let picker = preview::picker();
+    let mut app = app::App::new(source, playback, picker);
     let event_result = event::run(&mut terminal.terminal, &mut app).await;
     let restore_result = terminal.restore();
 

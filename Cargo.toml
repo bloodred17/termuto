@@ -17,7 +17,13 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 deeb = "0.0.13"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ratatui = "0.29"
+# Default features pull in chafa, which wants pkg-config and a system library at
+# build time; the protocols this needs are all built in.
+ratatui-image = { version = "9", default-features = false, features = [
+    "crossterm",
+] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
@@ -29,6 +35,7 @@ tokio = { version = "1", features = [
     "macros",
     "net",
     "rt-multi-thread",
+    "sync",
     "time",
 ] }
 

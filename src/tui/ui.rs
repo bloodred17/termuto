@@ -1,7 +1,8 @@
 use super::app::{App, Screen, SearchFocus};
+use super::preview::Preview;
 use crate::catalog::Anime;
-use crate::live::LiveAnime;
 use crate::live::model::Named;
+use crate::live::{LiveAnime, LiveEpisode};
 use crate::source::AnimeSummary;
 use crate::source::model::EMPTY;
 use ratatui::{
@@ -11,6 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use ratatui_image::{FilterType, Resize, StatefulImage};
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -201,22 +203,191 @@ fn render_episodes(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// `/anime/{id}/full` carries an episode count, not an episode list, so the
-/// numbers are counted out and each one is playable.
-fn render_live_episodes(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(anime) = app.live_detail() else {
+/// The episode picker: the list on the left, and the selected episode's still
+/// and synopsis stacked in a column beside it.
+///
+/// Rows come from `/anime/{id}/episodes` where it reached them, and fall back to
+/// bare numbering for the rest, so every episode the title reports stays
+/// selectable even when the list is short.
+fn render_live_episodes(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(title) = app
+        .live_detail()
+        .map(|anime| format!("{} — episodes", anime.display_title()))
+    else {
         return;
     };
-    let items = (1..=app.live_episode_count())
-        .map(|number| ListItem::new(format!("{number:>3}  Episode {number}")))
+    let (list_area, side) = split_episode_area(app, area);
+
+    let width = list_area.width.saturating_sub(4) as usize;
+    let items = (0..app.live_episode_count())
+        .map(|index| match app.episode(index) {
+            Some(episode) => ListItem::new(episode_row(episode, width)),
+            None => ListItem::new(format!("{:>3}  Episode {}", index + 1, index + 1)),
+        })
         .collect::<Vec<_>>();
-    render_list(
-        frame,
+    render_list(frame, list_area, &title, items, app.episode_index);
+
+    if let Some(side) = side {
+        render_episode_side(frame, app, side);
+    }
+}
+
+/// The side column appears only when both a pane is wanted and there is room
+/// for one; on a narrow terminal the list keeps the whole width rather than
+/// both halves being squeezed into uselessness.
+fn split_episode_area(app: &App, area: Rect) -> (Rect, Option<Rect>) {
+    if !(app.show_preview || app.show_synopsis) || area.width < MIN_SPLIT_WIDTH {
+        return (area, None);
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    (columns[0], Some(columns[1]))
+}
+
+/// Below this the two columns are both too narrow to read.
+const MIN_SPLIT_WIDTH: u16 = 76;
+
+fn render_episode_side(frame: &mut Frame, app: &mut App, area: Rect) {
+    let rows = match (app.show_preview, app.show_synopsis) {
+        (true, true) => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Min(4)])
+            .split(area)
+            .to_vec(),
+        _ => vec![area],
+    };
+
+    let mut next = rows.iter();
+    if app.show_preview
+        && let Some(row) = next.next()
+    {
+        render_episode_preview(frame, app, *row);
+    }
+    if app.show_synopsis
+        && let Some(row) = next.next()
+    {
+        render_episode_synopsis(frame, app, *row);
+    }
+}
+
+fn render_episode_preview(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Preview · {} ", app.preview_protocol()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Read the state before drawing: the still needs the app back mutably, and
+    // holding a borrow across the branch would keep it.
+    let note = match app.selected_preview() {
+        Some(Preview::Ready(_)) => None,
+        Some(Preview::Pending) => Some("Loading image…"),
+        Some(Preview::Missing) => Some("Image unavailable"),
+        None => Some("No image for this episode"),
+    };
+
+    match note {
+        Some(note) => frame.render_widget(
+            Paragraph::new(centered_note(note, inner.height)).alignment(Alignment::Center),
+            inner,
+        ),
+        None => {
+            if let Some(Preview::Ready(protocol)) = app.selected_preview_mut() {
+                // Lanczos only costs anything when the pane is resized, and it
+                // is the difference between a sharp still and a soft one on a
+                // terminal that draws real pixels.
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Fit(Some(FilterType::Lanczos3))),
+                    inner,
+                    protocol.as_mut(),
+                );
+            }
+        }
+    }
+}
+
+/// A one-line placeholder, sat where the middle of the image would be.
+fn centered_note(text: &str, height: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(""); (height as usize).saturating_sub(1) / 2];
+    lines.push(Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn render_episode_synopsis(frame: &mut Frame, app: &App, area: Rect) {
+    let episode = app.selected_episode();
+    let lines = match episode.and_then(|episode| non_empty(episode.synopsis.as_deref())) {
+        // Split on the synopsis' own newlines rather than handing the whole
+        // thing over as one line: `Wrap` rewraps each line it is given, so a
+        // single line would run the paragraphs and the source note together.
+        Some(synopsis) => synopsis
+            .lines()
+            .map(|line| Line::from(line.to_string()))
+            .collect(),
+        None => vec![Line::from(Span::styled(
+            "No synopsis for this episode.",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    // The runtime rides in the title: it is one short fact, and the pane is for
+    // prose.
+    let title = match episode.and_then(LiveEpisode::duration_label) {
+        Some(duration) => format!(" Synopsis · {duration} "),
+        None => " Synopsis ".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: true }),
         area,
-        &format!("{} — episodes", anime.display_title()),
-        items,
-        app.episode_index,
     );
+}
+
+/// `  1  The Journey's End          2023-09-29  4.29`, with the title taking
+/// whatever the fixed columns leave.
+fn episode_row(episode: &LiveEpisode, width: usize) -> Line<'static> {
+    let aired = episode.aired_label().unwrap_or_else(|| EMPTY.to_string());
+    let score = episode.score_label();
+
+    // Number, gaps, date, and score are fixed; the title flexes.
+    let fixed = 3 + 2 + 2 + 10 + 2 + 4;
+    let title_width = width.saturating_sub(fixed).max(8);
+    let title = pad(
+        &truncate_to(&episode.display_title(), title_width),
+        title_width,
+    );
+
+    Line::from(vec![
+        Span::styled(
+            format!("{:>3}  ", episode.mal_id),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(title),
+        Span::styled(
+            format!("  {aired:>10}  "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("{:>4}", score.clone().unwrap_or_else(|| EMPTY.to_string())),
+            Style::default().fg(score_color(episode.score)),
+        ),
+    ])
+}
+
+/// Episode scores are out of 5 and cluster high, so the bands are set where a
+/// glance down the column separates the standouts from the rest.
+fn score_color(score: Option<f64>) -> Color {
+    match score {
+        Some(score) if score >= 4.25 => Color::Green,
+        Some(score) if score >= 3.75 => Color::Yellow,
+        Some(_) => Color::Gray,
+        None => Color::DarkGray,
+    }
 }
 
 fn render_movie(frame: &mut Frame, app: &App, area: Rect) {
@@ -571,7 +742,10 @@ fn help_text(app: &App) -> &'static str {
         Screen::Search => "Type a query • Enter search • ↓ results • Esc back • Ctrl-C quit",
         Screen::SeasonPicker => "↑/↓ or j/k select • Enter open • p Provider • a Auto • Esc back",
         Screen::LiveDetail => "↑/↓ or j/k scroll • Enter play • p Provider • a Auto • Esc back",
-        Screen::Episodes | Screen::LiveEpisodes | Screen::MovieDetail => {
+        Screen::LiveEpisodes => {
+            "↑/↓ or j/k select • Enter play • v Image • s Synopsis • p Provider • Esc back"
+        }
+        Screen::Episodes | Screen::MovieDetail => {
             "↑/↓ or j/k select • Enter play • p Provider • a Auto • Esc back"
         }
         Screen::Playing => "Any key to dismiss",
@@ -676,14 +850,24 @@ fn thousands(value: u64) -> String {
 }
 
 fn truncate(text: &str, width: usize) -> String {
-    let budget = width.saturating_sub(4);
-    if text.chars().count() <= budget {
+    truncate_to(text, width.saturating_sub(4))
+}
+
+/// Cuts `text` to `width` cells, marking the cut with an ellipsis.
+fn truncate_to(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
         return text.to_string();
     }
     text.chars()
-        .take(budget.saturating_sub(1))
+        .take(width.saturating_sub(1))
         .collect::<String>()
         + "…"
+}
+
+/// Pads `text` out to `width` so the columns after it line up.
+fn pad(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    format!("{text}{}", " ".repeat(width.saturating_sub(length)))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -707,11 +891,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Color, header_line, thousands, wrap_text};
+    use super::{App, Color, Screen, header_line, render, thousands, truncate_to, wrap_text};
+    use crate::live::{LiveAnime, LiveEpisode};
     use crate::mode::Mode;
     use crate::playback::{Playback, TrackPrefs};
-    use crate::source::Source;
+    use crate::source::{AnimeDetail, Source};
     use crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_image::picker::Picker;
 
     async fn app() -> App {
         let source = Source::open(Mode::Cached, "catalog.json")
@@ -723,7 +910,8 @@ mod tests {
             "true".to_string(),
         )
         .expect("playback builds");
-        App::new(source, playback)
+        // Nothing here queries a terminal, so the fallback renderer stands in.
+        App::new(source, playback, Picker::halfblocks())
     }
 
     fn header(app: &App) -> String {
@@ -782,5 +970,123 @@ mod tests {
     fn counts_get_thousands_separators() {
         assert_eq!(thousands(1_492_875), "1,492,875");
         assert_eq!(thousands(42), "42");
+    }
+
+    #[test]
+    fn a_cut_title_says_so() {
+        assert_eq!(truncate_to("The Journey's End", 8), "The Jou…");
+        assert_eq!(truncate_to("Short", 8), "Short");
+    }
+
+    /// Two episodes as `/anime/{id}/episodes` returns them, trimmed to the
+    /// fields the picker draws.
+    fn episodes() -> Vec<LiveEpisode> {
+        serde_json::from_str(
+            r#"[{"mal_id":1,"title":"The Journey's End","duration":1559,
+                 "aired":"2023-09-29T00:00:00+00:00","score":4.29,
+                 "synopsis":"After defeating the Demon King, Himmel and his crew return.",
+                 "images":{"jpg":{"image_url":"https://example.test/1.jpg"}}},
+                {"mal_id":2,"title":"It Didn't Have to Be Magic","aired":null,"score":null}]"#,
+        )
+        .expect("the episode payload deserializes")
+    }
+
+    fn frieren(app: &mut App, count: u32) {
+        app.detail = Some(AnimeDetail::Live(Box::new(LiveAnime {
+            mal_id: 52991,
+            title: "Sousou no Frieren".into(),
+            title_english: Some("Frieren".into()),
+            episodes: Some(count),
+            ..LiveAnime::default()
+        })));
+        app.episodes = episodes();
+        app.screen = Screen::LiveEpisodes;
+    }
+
+    fn draw(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("the test backend builds");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn an_episode_row_carries_its_title_air_date_and_score() {
+        let mut app = app().await;
+        frieren(&mut app, 2);
+        let screen = draw(&mut app, 120, 20);
+        assert!(screen.contains("The Journey's End"), "{screen}");
+        assert!(screen.contains("2023-09-29"), "{screen}");
+        assert!(screen.contains("4.29"), "{screen}");
+        // An episode the API has no date or score for still gets a row.
+        assert!(screen.contains("It Didn't Have to Be Magic"), "{screen}");
+    }
+
+    /// Both panes start open, and each key closes only its own. The panes are
+    /// looked for by their block titles: the help line at the foot of the
+    /// screen names both keys, so the bare words are always on screen.
+    #[tokio::test]
+    async fn v_and_s_toggle_the_preview_and_synopsis_panes() {
+        let mut app = app().await;
+        frieren(&mut app, 2);
+        let both = draw(&mut app, 120, 20);
+        assert!(
+            both.contains(PREVIEW_PANE) && both.contains(SYNOPSIS_PANE),
+            "{both}"
+        );
+        assert!(both.contains("After defeating the Demon King"), "{both}");
+        // The runtime rides in the synopsis title.
+        assert!(both.contains("Synopsis · 25m"), "{both}");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        let no_preview = draw(&mut app, 120, 20);
+        assert!(!no_preview.contains(PREVIEW_PANE), "{no_preview}");
+        assert!(no_preview.contains(SYNOPSIS_PANE), "{no_preview}");
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        let neither = draw(&mut app, 120, 20);
+        assert!(!neither.contains(SYNOPSIS_PANE), "{neither}");
+        // With nothing beside it, the list takes the whole width back.
+        assert!(neither.contains("The Journey's End"), "{neither}");
+    }
+
+    const PREVIEW_PANE: &str = "┌ Preview";
+    const SYNOPSIS_PANE: &str = "┌ Synopsis";
+
+    /// The API pages its episode list, and a still-airing title can report more
+    /// episodes than a page returns. The remainder is still selectable.
+    #[tokio::test]
+    async fn episodes_past_the_fetched_list_are_numbered_out() {
+        let mut app = app().await;
+        frieren(&mut app, 4);
+        let screen = draw(&mut app, 120, 20);
+        assert_eq!(app.live_episode_count(), 4);
+        assert!(
+            screen.contains("Episode 3") && screen.contains("Episode 4"),
+            "{screen}"
+        );
+    }
+
+    /// Neither pane is worth the width it would take from the list here.
+    #[tokio::test]
+    async fn a_narrow_terminal_keeps_the_list_and_drops_the_side_column() {
+        let mut app = app().await;
+        frieren(&mut app, 2);
+        let screen = draw(&mut app, 60, 20);
+        assert!(
+            !screen.contains(PREVIEW_PANE) && !screen.contains(SYNOPSIS_PANE),
+            "{screen}"
+        );
+        assert!(screen.contains("The Journey's End"), "{screen}");
     }
 }
